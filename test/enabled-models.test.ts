@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -22,10 +22,15 @@ function makeRegistry(models = MODELS, available?: typeof MODELS): ModelRegistry
 
 describe("readEnabledModels", () => {
   let agentDir: string;
+  let projectDir: string;
   let originalEnv: string | undefined;
 
+  const projectFile = () => join(projectDir, ".pi", "settings.json");
+  const globalFile = () => join(agentDir, "settings.json");
+
   beforeEach(() => {
-    agentDir = mkdtempSync(join(tmpdir(), "pi-em-"));
+    agentDir = mkdtempSync(join(tmpdir(), "pi-em-global-"));
+    projectDir = mkdtempSync(join(tmpdir(), "pi-em-project-"));
     originalEnv = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = agentDir;
   });
@@ -34,32 +39,69 @@ describe("readEnabledModels", () => {
     if (originalEnv == null) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalEnv;
     rmSync(agentDir, { recursive: true, force: true });
+    rmSync(projectDir, { recursive: true, force: true });
   });
 
-  it("returns undefined when settings file missing", () => {
-    expect(readEnabledModels()).toBeUndefined();
+  function writeProject(obj: unknown) {
+    mkdirSync(join(projectDir, ".pi"), { recursive: true });
+    writeFileSync(projectFile(), JSON.stringify(obj));
+  }
+
+  it("returns undefined when both settings files are missing", () => {
+    expect(readEnabledModels(projectDir)).toBeUndefined();
   });
 
-  it("returns undefined when field absent", () => {
-    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultProvider: "openai" }));
-    expect(readEnabledModels()).toBeUndefined();
+  it("returns undefined when field absent from both files", () => {
+    writeFileSync(globalFile(), JSON.stringify({ defaultProvider: "openai" }));
+    expect(readEnabledModels(projectDir)).toBeUndefined();
   });
 
-  it("returns enabledModels array", () => {
-    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
+  it("returns enabledModels from global when project file absent", () => {
+    writeFileSync(globalFile(), JSON.stringify({
       enabledModels: ["anthropic/claude-sonnet-4-6", "google/gemma-4-31b-it"],
     }));
-    expect(readEnabledModels()).toEqual(["anthropic/claude-sonnet-4-6", "google/gemma-4-31b-it"]);
+    expect(readEnabledModels(projectDir)).toEqual([
+      "anthropic/claude-sonnet-4-6",
+      "google/gemma-4-31b-it",
+    ]);
   });
 
-  it("returns undefined for corrupt JSON", () => {
-    writeFileSync(join(agentDir, "settings.json"), "not json {{{");
-    expect(readEnabledModels()).toBeUndefined();
+  it("returns enabledModels from project when global file absent", () => {
+    writeProject({ enabledModels: ["anthropic/claude-haiku-4-5"] });
+    expect(readEnabledModels(projectDir)).toEqual(["anthropic/claude-haiku-4-5"]);
   });
 
-  it("returns undefined when enabledModels is not an array", () => {
-    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: "anthropic/claude-sonnet-4-6" }));
-    expect(readEnabledModels()).toBeUndefined();
+  it("project overrides global (array replaces wholly, mirrors pi's deep-merge)", () => {
+    writeFileSync(globalFile(), JSON.stringify({
+      enabledModels: ["anthropic/claude-sonnet-4-6", "anthropic/claude-opus-4-6"],
+    }));
+    writeProject({ enabledModels: ["anthropic/claude-haiku-4-5"] });
+    // Project replaces wholly — globals NOT merged in
+    expect(readEnabledModels(projectDir)).toEqual(["anthropic/claude-haiku-4-5"]);
+  });
+
+  it("falls back to global when project file has no enabledModels field", () => {
+    writeFileSync(globalFile(), JSON.stringify({
+      enabledModels: ["anthropic/claude-sonnet-4-6"],
+    }));
+    writeProject({ defaultProvider: "anthropic" }); // project exists but no enabledModels
+    expect(readEnabledModels(projectDir)).toEqual(["anthropic/claude-sonnet-4-6"]);
+  });
+
+  it("returns undefined when global JSON is corrupt (try/catch swallow)", () => {
+    writeFileSync(globalFile(), "not json {{{");
+    expect(readEnabledModels(projectDir)).toBeUndefined();
+  });
+
+  it("returns undefined when enabledModels is not an array (global)", () => {
+    writeFileSync(globalFile(), JSON.stringify({ enabledModels: "anthropic/claude-sonnet-4-6" }));
+    expect(readEnabledModels(projectDir)).toBeUndefined();
+  });
+
+  it("returns undefined when enabledModels is not an array (project)", () => {
+    writeProject({ enabledModels: "anthropic/claude-haiku-4-5" });
+    // Project's non-array enabledModels is invalid → falls back to global; global empty → undefined
+    expect(readEnabledModels(projectDir)).toBeUndefined();
   });
 });
 

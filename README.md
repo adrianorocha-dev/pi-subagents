@@ -314,7 +314,7 @@ When background agents complete, they notify the main agent. The **join mode** c
 
 **Opt-in:** off by default. Enable via `/agents → Settings → Scope models`.
 
-When on, each subagent spawn's effective model is validated against pi's own `enabledModels` list (configured via pi's `/scoped-models` UI, stored in `~/.pi/agent/settings.json`). pi-subagents reads that list; it doesn't manage it.
+When on, each subagent spawn's effective model is validated against pi's own `enabledModels` list (configured via pi's `/scoped-models` UI). pi-subagents reads that list; it doesn't manage it. Both of pi's settings files are honored: global `~/.pi/agent/settings.json` and project-local `<cwd>/.pi/settings.json`. **Project overrides global** — mirrors pi's `SettingsManager` deep-merge, so a tighter per-project scope (hand-edited into the project settings) is respected.
 
 **Out-of-scope handling depends on source:**
 

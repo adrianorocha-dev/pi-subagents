@@ -28,7 +28,9 @@ export interface SubagentsSettings {
   schedulingEnabled?: boolean;
   /**
    * When true, the effective model of each subagent spawn is validated
-   * against `enabledModels` from pi's global settings (`~/.pi/agent/settings.json`).
+   * against `enabledModels` from pi's settings — both global
+   * (`<agentDir>/settings.json`) and project-local (`<cwd>/.pi/settings.json`),
+   * with project overriding global (mirrors pi's SettingsManager deep-merge).
    *
    * scopeModels guards against runtime LLM choices, not user-level config.
    * Out-of-scope handling reflects this:

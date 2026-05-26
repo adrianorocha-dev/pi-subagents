@@ -1,6 +1,13 @@
 /**
- * Reads enabledModels from pi's global settings (`~/.pi/agent/settings.json`)
- * and resolves entries to concrete `provider/modelId` keys for scope validation.
+ * Reads `enabledModels` from pi's settings (global `<agentDir>/settings.json`
+ * + project-local `<cwd>/.pi/settings.json`, project wins) and resolves
+ * entries to concrete `provider/modelId` keys for scope validation.
+ *
+ * **Project overrides global**, mirroring pi's own `SettingsManager`
+ * deep-merge behavior and matching the precedence we use for our own
+ * `subagents.json` settings (see `src/settings.ts:loadSettings`). If
+ * project file has `enabledModels` set, it wholly replaces global's
+ * (array fields are replaced, not concatenated).
  *
  * **Limited subset of upstream's resolveModelScope.** We support exact
  * `provider/modelId` matching only. Upstream (pi-coding-agent's
@@ -30,9 +37,16 @@ export interface ModelRegistryRef {
   getAvailable?(): unknown[];
 }
 
-/** Read enabledModels from global pi settings. Undefined when file missing or field absent. */
-export function readEnabledModels(): string[] | undefined {
-  const path = join(getAgentDir(), "settings.json");
+/** Paths to pi's settings.json files: [project, global] (project takes precedence). */
+function settingsPaths(cwd: string): [project: string, global: string] {
+  return [
+    join(cwd, ".pi", "settings.json"),
+    join(getAgentDir(), "settings.json"),
+  ];
+}
+
+/** Read `enabledModels` from a single settings.json file. Undefined when missing or absent. */
+function readField(path: string): string[] | undefined {
   if (!existsSync(path)) return undefined;
   try {
     const raw = JSON.parse(readFileSync(path, "utf-8"));
@@ -44,38 +58,55 @@ export function readEnabledModels(): string[] | undefined {
 }
 
 /**
+ * Read enabledModels from pi's settings — project-local overrides global.
+ * Mirrors pi's SettingsManager deep-merge for the `enabledModels` field
+ * (and matches our own loadSettings precedence in src/settings.ts).
+ * Returns undefined when neither file has the field.
+ */
+export function readEnabledModels(cwd: string): string[] | undefined {
+  const [project, global] = settingsPaths(cwd);
+  return readField(project) ?? readField(global);
+}
+
+/**
  * Resolve enabledModels patterns → Set<"provider/modelId"> (lowercase keys).
  *
  * Only exact `provider/modelId` patterns are matched (case-insensitive).
  * Patterns without a slash, with glob characters, or with a `:thinking`
  * suffix are silently dropped. See module-level docstring for rationale.
  *
- * Cache: keyed on settings.json mtime+size + JSON.stringify(patterns).
- * Re-resolves only when the file changes or the patterns argument differs.
+ * Cache: keyed on JSON.stringify(patterns) + mtime/size of *both*
+ * project and global settings.json files. Re-resolves when either file
+ * changes or the patterns argument differs.
  *
  * Returns undefined when no patterns are provided or no patterns match
  * (scope check becomes a no-op at the call site).
  */
 
-// Module-level cache — invalidated when settings.json changes or patterns differ.
+// Module-level cache — invalidated when either settings.json changes or patterns differ.
 let cachedAllowed: Set<string> | undefined;
 let cachedHash = "";
 let cachedPatternsKey = "";
 
+/** mtime+size hash of one file, or "missing" if absent. */
+function hashOf(path: string): string {
+  try {
+    const s = statSync(path);
+    return `${s.mtimeMs}-${s.size}`;
+  } catch {
+    return "missing";
+  }
+}
+
 export function resolveEnabledModels(
   patterns: string[] | undefined,
   registry: ModelRegistryRef,
+  cwd: string = process.cwd(),
 ): Set<string> | undefined {
-  // Fast path: check cache
+  // Fast path: check cache (stat both project and global settings.json files)
   const patternsKey = JSON.stringify(patterns);
-  const settingsPath = join(getAgentDir(), "settings.json");
-  let fileHash: string;
-  try {
-    const stat = statSync(settingsPath);
-    fileHash = `${stat.mtimeMs}-${stat.size}`;
-  } catch {
-    fileHash = "missing";
-  }
+  const [project, global] = settingsPaths(cwd);
+  const fileHash = `${hashOf(project)};${hashOf(global)}`;
 
   if (fileHash === cachedHash && patternsKey === cachedPatternsKey) {
     return cachedAllowed;

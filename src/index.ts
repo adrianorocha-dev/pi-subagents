@@ -521,9 +521,11 @@ export default function (pi: ExtensionAPI) {
 
   // ---- Scope models configuration ----
   // When enabled, subagent model choices are validated against `enabledModels`
-  // in pi's global `~/.pi/agent/settings.json`. Off by default; opt-in via
-  // `/agents → Settings`. See docstring on SubagentsSettings.scopeModels for
-  // the hard-error vs warn-and-proceed policy and its rationale.
+  // from pi's settings — both global `<agentDir>/settings.json` and
+  // project-local `<cwd>/.pi/settings.json` (project overrides global).
+  // Off by default; opt-in via `/agents → Settings`. See docstring on
+  // SubagentsSettings.scopeModels for the hard-error vs warn-and-proceed
+  // policy and its rationale.
   let scopeModelsEnabled = false;
   function isScopeModelsEnabled(): boolean { return scopeModelsEnabled; }
   function setScopeModelsEnabled(enabled: boolean): void { scopeModelsEnabled = enabled; }
@@ -881,7 +883,7 @@ Terse command-style prompts produce shallow, generic work.
       //     user authored/installed this agent or chose the parent's model; trust it).
       // See SubagentsSettings.scopeModels docstring for the full policy.
       if (isScopeModelsEnabled() && model) {
-        const allowed = resolveEnabledModels(readEnabledModels(), ctx.modelRegistry);
+        const allowed = resolveEnabledModels(readEnabledModels(ctx.cwd), ctx.modelRegistry, ctx.cwd);
         if (allowed && !isModelInScope(model, allowed)) {
           if (resolvedConfig.modelFromParams) {
             const list = [...allowed].sort().map(m => `  ${m}`).join("\n");
