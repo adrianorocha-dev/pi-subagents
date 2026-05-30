@@ -36,8 +36,13 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
     }
 
     async reload() {
-      // Tests pre-register the extensions a path should resolve to; an
-      // unregistered path simply yields no extension (a failed load).
+      // Mirror the real loader: `noExtensions: true` zeros out the discovered set
+      // entirely. Otherwise tests pre-register the extensions a path should
+      // resolve to; an unregistered path simply yields no extension (a failed load).
+      if (this.opts.noExtensions) {
+        loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
+        return;
+      }
       if (this.opts.extensionsOverride) {
         loaderExtensionsRef.current = this.opts.extensionsOverride(loaderExtensionsRef.current);
       }
@@ -950,32 +955,48 @@ describe("agent-runner ext: tool selectors", () => {
     expect(tools).not.toContain("baz");
   });
 
-  it("ext:foo pulls a discoverable extension in even when extensions: false", async () => {
+  it("ext:foo is orphaned when extensions: false — no extension loads, warning fires", async () => {
+    // `extensions:` is the sole loading authority. `ext:` selectors can only narrow
+    // within the loaded set; they cannot pull an excluded extension back in.
     setupExtAgent({ extensions: false, builtinToolNames: ["read"], extSelectors: ["ext:foo"] });
     withExtensions({ "/ext/foo.ts": ["foo_tool"], "/ext/other.ts": ["other_tool"] });
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
 
-    await runAgent(ctx, "Explore", "go", { pi });
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
 
-    // noExtensions must be false so foo can load; override keeps only foo.
-    expect(lastLoaderOpts().noExtensions).toBe(false);
+    expect(lastLoaderOpts().noExtensions).toBe(true);
     const tools = lastToolsPassed();
-    expect(tools).toEqual(expect.arrayContaining(["read", "foo_tool"]));
-    expect(tools).not.toContain("other_tool");
+    expect(tools).toEqual(["read"]);
+    expect(tools).not.toContain("foo_tool");
+    expect(onToolActivity).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolName: expect.stringContaining('extension-error:ext:foo'),
+      }),
+    );
   });
 
-  it("ext: name joins the loader keep-set; a loaded-but-unselected extension is muted", async () => {
+  it("ext: cannot pull an extension that `extensions: [...]` excludes — warns, no surfacing", async () => {
+    // extensions: [a] loads only a. ext:foo references foo, which isn't loaded;
+    // the opt-in flip still mutes a (it isn't named in ext:), so the agent gets
+    // zero extension tools and a warning fires.
     setupExtAgent({ extensions: ["a"], builtinToolNames: [], extSelectors: ["ext:foo"] });
     withExtensions({ "/ext/a.ts": ["a_tool"], "/ext/foo.ts": ["foo_tool"] });
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
 
-    await runAgent(ctx, "Explore", "go", { pi });
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
 
     const tools = lastToolsPassed();
-    expect(tools).toContain("foo_tool");
-    expect(tools).not.toContain("a_tool"); // a loads (handlers fire) but is muted
+    expect(tools).not.toContain("foo_tool"); // foo never loaded
+    expect(tools).not.toContain("a_tool");   // a loaded but muted by the ext: opt-in flip
+    expect(onToolActivity).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolName: expect.stringContaining('extension-error:ext:foo'),
+      }),
+    );
   });
 
   it("['*'] short-circuit survives ext: narrowing", async () => {
@@ -993,7 +1014,7 @@ describe("agent-runner ext: tool selectors", () => {
     expect(tools).not.toContain("other_tool"); // flip mutes the unselected extension
   });
 
-  it("warns but proceeds when an ext: name never loads", async () => {
+  it("warns but proceeds when an ext: name doesn't match any loaded extension", async () => {
     setupExtAgent({ extensions: true, builtinToolNames: ["read"], extSelectors: ["ext:ghost"] });
     withExtensions({ "/ext/real.ts": ["real_tool"] });
     const { session } = createSession("OK");
@@ -1005,7 +1026,7 @@ describe("agent-runner ext: tool selectors", () => {
     expect(result.responseText).toBe("OK");
     expect(onToolActivity).toHaveBeenCalledWith(
       expect.objectContaining({
-        toolName: expect.stringContaining('extension-error:extension "ghost"'),
+        toolName: expect.stringContaining('extension-error:ext:ghost'),
       }),
     );
   });

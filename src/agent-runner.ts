@@ -348,19 +348,19 @@ export async function runAgent(
   // would defeat prompt_mode: replace and isolated: true. Parent context, if
   // wanted, reaches the subagent via prompt_mode: append (parentSystemPrompt
   // is embedded in systemPromptOverride) or inherit_context (conversation).
-  // `ext:` selectors from the `tools:` CSV: which extensions to keep loaded, and
-  // per-extension tool narrowing. `isolated` means no extension tools at all.
+  // `ext:` selectors from the `tools:` CSV narrow which extension tools surface to
+  // the LLM. They do NOT control loading — `extensions:` is the sole authority for
+  // which extensions load. `ext:foo` against an extension that `extensions:` excluded
+  // is an orphan and warns after reload. `isolated` means no extension tools at all.
   const { extNames, narrowing } = parseExtSelectors(
     options.isolated ? [] : (agentConfig?.extSelectors ?? []),
   );
-  // `ext:foo` can pull a discoverable extension in even when `extensions:` is false.
-  const noExtensions = extensions === false && extNames.size === 0;
+  const noExtensions = extensions === false;
 
   const extensionsSpec = Array.isArray(extensions)
     ? parseExtensionsSpec(extensions, effectiveCwd)
     : undefined;
-  // `ext:` names join the loader keep-set alongside `extensions:` names.
-  const keepNames = new Set([...(extensionsSpec?.names ?? []), ...extNames]);
+  const keepNames = extensionsSpec?.names ?? new Set<string>();
   // The override filters loaded extensions down to `keepNames`. It's only needed
   // when we're neither loading everything (`extensions: true` or a `"*"` wildcard)
   // nor nothing (`noExtensions`).
@@ -406,9 +406,14 @@ export async function runAgent(
   }
 
   // A subagent spawns mid-task, so a bad `extensions:`/`ext:` entry warns rather
-  // than aborts. Path entries fold their canonical name into `names`, so this
-  // single check covers unmatched names, failed paths, and unknown `ext:` names.
-  if (keepNames.size > 0) {
+  // than aborts. Two distinct misconfigurations to catch:
+  //   - `extensions: [foo]` but no extension named foo was discovered (typo or
+  //     path that failed to load — path entries fold their canonical name into
+  //     `keepNames`, so this covers them too).
+  //   - `tools: ext:foo` but foo isn't in the loaded set (because `extensions:`
+  //     didn't include it). Since v0.9, `ext:` no longer pulls extensions in;
+  //     loading is `extensions:`-authoritative.
+  if (keepNames.size > 0 || extNames.size > 0) {
     const survivingNames = new Set(
       loader.getExtensions().extensions.map((e) => extensionCanonicalName(e.path)),
     );
@@ -417,6 +422,14 @@ export async function runAgent(
         options.onToolActivity?.({
           type: "end",
           toolName: `extension-error:extension "${name}" requested by agent "${type}" was not loaded`,
+        });
+      }
+    }
+    for (const name of extNames) {
+      if (!survivingNames.has(name)) {
+        options.onToolActivity?.({
+          type: "end",
+          toolName: `extension-error:ext:${name} referenced by agent "${type}" but extension "${name}" is not loaded (add it to extensions:)`,
         });
       }
     }
