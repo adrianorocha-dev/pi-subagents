@@ -6,7 +6,7 @@
  */
 
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import { type Component, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type Component, Input, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { extractText } from "../context.js";
 import type { AgentRecord } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent } from "../usage.js";
@@ -29,6 +29,8 @@ export class ConversationViewer implements Component {
   /** Two-press confirm guard for the stop key, so a stray key can't kill the agent. */
   private stopArmed = false;
   private keys: ViewerKeys;
+  /** Steering composer — present while the user is typing a message to the agent. */
+  private composer: Input | undefined;
 
   constructor(
     private tui: TUI,
@@ -41,6 +43,8 @@ export class ConversationViewer implements Component {
     private onStop?: () => void,
     /** User keybindings from `ctx.ui.custom()`. Omitted → hardcoded defaults. */
     keybindings?: ViewerKeybindings,
+    /** Send a steering message to the agent. Omitted → no compose affordance. */
+    private onSteer?: (message: string) => void,
   ) {
     this.keys = createViewerKeys(keybindings);
     this.unsubscribe = session.subscribe(() => {
@@ -50,9 +54,25 @@ export class ConversationViewer implements Component {
   }
 
   handleInput(data: string): void {
+    // While composing a steer message, the input owns all keys (Enter sends,
+    // Esc cancels — both wired in openComposer()). Editing keys flow through.
+    if (this.composer) {
+      this.composer.handleInput(data);
+      this.tui.requestRender();
+      return;
+    }
+
     if (matchesKey(data, "escape") || matchesKey(data, "q")) {
       this.closed = true;
       this.done(undefined);
+      return;
+    }
+
+    // Open the steering composer (only while the agent can still be steered).
+    // When not steerable, fall through so the key still disarms a pending stop.
+    if (matchesKey(data, "i") && this.canSteer()) {
+      this.stopArmed = false;
+      this.openComposer();
       return;
     }
 
@@ -162,19 +182,31 @@ export class ConversationViewer implements Component {
 
     // Footer
     lines.push(hrMid);
-    const scrollPct = contentLines.length <= viewportHeight
-      ? "100%"
-      : `${Math.round(((visibleStart + viewportHeight) / contentLines.length) * 100)}%`;
-    const footerLeft = th.fg("dim", `${contentLines.length} lines · ${scrollPct}`);
-    const scrollHint = th.fg("dim", "↑↓ scroll · PgUp/PgDn or Shift+↑↓ · Esc close");
-    // Stop hint goes first in the right group so it survives right-edge
-    // truncation on narrow terminals (the scroll hint is the expendable part).
-    const footerRight = this.isStoppable()
-      ? (this.stopArmed ? th.fg("error", "x again to STOP") : th.fg("dim", "x stop")) +
-        th.fg("dim", " · ") + scrollHint
-      : scrollHint;
-    const footerGap = Math.max(1, innerW - visibleWidth(footerLeft) - visibleWidth(footerRight));
-    lines.push(row(footerLeft + " ".repeat(footerGap) + footerRight));
+    if (this.composer) {
+      // Composer row: the Input renders its own `> ` prompt and cursor.
+      lines.push(row(this.composer.render(innerW)[0] ?? ""));
+      const composeHint = th.fg("dim", "Enter send · Esc cancel");
+      const composeLeft = th.fg("accent", "✎ steer");
+      const composeGap = Math.max(1, innerW - visibleWidth(composeLeft) - visibleWidth(composeHint));
+      lines.push(row(composeLeft + " ".repeat(composeGap) + composeHint));
+    } else {
+      const scrollPct = contentLines.length <= viewportHeight
+        ? "100%"
+        : `${Math.round(((visibleStart + viewportHeight) / contentLines.length) * 100)}%`;
+      const footerLeft = th.fg("dim", `${contentLines.length} lines · ${scrollPct}`);
+      const scrollHint = th.fg("dim", "↑↓ scroll · Esc close");
+      // Stop/steer hints go first in the right group so they survive right-edge
+      // truncation on narrow terminals (the scroll hint is the expendable part).
+      const rightParts: string[] = [];
+      if (this.canSteer()) rightParts.push(th.fg("dim", "i steer"));
+      if (this.isStoppable()) {
+        rightParts.push(this.stopArmed ? th.fg("error", "x again to STOP") : th.fg("dim", "x stop"));
+      }
+      rightParts.push(scrollHint);
+      const footerRight = rightParts.join(th.fg("dim", " · "));
+      const footerGap = Math.max(1, innerW - visibleWidth(footerLeft) - visibleWidth(footerRight));
+      lines.push(row(footerLeft + " ".repeat(footerGap) + footerRight));
+    }
     lines.push(hrBot);
 
     return lines;
@@ -183,6 +215,29 @@ export class ConversationViewer implements Component {
   /** Stoppable only when a stop handler exists and the agent is still active. */
   private isStoppable(): boolean {
     return !!this.onStop && (this.record.status === "running" || this.record.status === "queued");
+  }
+
+  /** Steerable only when a steer handler exists and the agent is still active. */
+  private canSteer(): boolean {
+    return !!this.onSteer && (this.record.status === "running" || this.record.status === "queued");
+  }
+
+  /** Open the inline steering composer and route subsequent input to it. */
+  private openComposer(): void {
+    const input = new Input();
+    input.focused = true;
+    input.onSubmit = (value: string) => {
+      const message = value.trim();
+      this.composer = undefined;
+      if (message) this.onSteer?.(message);
+      this.tui.requestRender();
+    };
+    input.onEscape = () => {
+      this.composer = undefined;
+      this.tui.requestRender();
+    };
+    this.composer = input;
+    this.tui.requestRender();
   }
 
   invalidate(): void { /* no cached state to clear */ }
@@ -205,7 +260,8 @@ export class ConversationViewer implements Component {
   }
 
   private chromeLines(): number {
-    return CHROME_LINES_BASE + (this.invocationLine() ? 1 : 0);
+    // The composer adds one row above the footer hint while it's open.
+    return CHROME_LINES_BASE + (this.invocationLine() ? 1 : 0) + (this.composer ? 1 : 0);
   }
 
   private invocationLine(): string | undefined {
