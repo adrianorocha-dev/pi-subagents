@@ -191,6 +191,14 @@ async function flush(): Promise<void> {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
+function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+  let resolvePromise: (() => void) | undefined;
+  const promise = new Promise<void>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: () => resolvePromise?.() };
+}
+
 describe("SubagentHostV1 integration", () => {
   let projectDir: string;
   let agentDir: string;
@@ -531,6 +539,80 @@ Project override.
     const failedEvents = emitted(harness, "subagents:failed") as Array<{ metadata?: unknown; status?: string }>;
     expect(failedEvents).toHaveLength(1);
     expect(failedEvents[0]).toMatchObject({ metadata, status: "stopped" });
+  });
+
+  it("keeps stopped completion and waitForAll pending until manager settlement and queued hooks drain", async () => {
+    const managerRelease = deferred();
+    const hookRelease = deferred();
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      const { session } = createSession();
+      await options.configureSession?.(session as never);
+      options.onSessionCreated?.(session as never);
+      options.onTurnEnd?.(1);
+      await managerRelease.promise;
+      return {
+        responseText: "late result",
+        session,
+        aborted: false,
+        steered: false,
+      } as unknown as RunResult;
+    });
+    const { harness, host } = await activate();
+    const onTurn = vi.fn(() => hookRelease.promise);
+    const spawn = host.spawn(request(), { onTurn });
+    await flush();
+    expect(onTurn).toHaveBeenCalledTimes(1);
+
+    expect(host.stop(spawn.agentId)).toBe(true);
+    expect(host.stop(spawn.agentId)).toBe(false);
+    let completionSettled = false;
+    const completion = spawn.completion.then((result) => {
+      completionSettled = true;
+      return result;
+    });
+    let waitSettled = false;
+    const waiter = host.waitForAll().then(() => {
+      waitSettled = true;
+    });
+
+    await flush();
+    expect(completionSettled).toBe(false);
+    expect(waitSettled).toBe(false);
+
+    managerRelease.resolve();
+    await flush();
+    expect(completionSettled).toBe(false);
+    expect(waitSettled).toBe(false);
+    expect(emitted(harness, "subagents:failed")).toHaveLength(1);
+
+    hookRelease.resolve();
+    await expect(completion).resolves.toMatchObject({
+      agentId: spawn.agentId,
+      status: "stopped",
+      text: null,
+    });
+    await waiter;
+    expect(waitSettled).toBe(true);
+    expect(onTurn).toHaveBeenCalledTimes(1);
+    expect(emitted(harness, "subagents:failed")).toHaveLength(1);
+    expect(emitted(harness, "subagents:completed")).toHaveLength(0);
+  });
+
+  it("preserves failure normalization when no cancellation is accepted", async () => {
+    vi.mocked(runAgent).mockRejectedValueOnce(new Error("provider unavailable"));
+    const { harness, host } = await activate();
+
+    const spawn = host.spawn(request());
+
+    await expect(spawn.completion).resolves.toEqual({
+      agentId: spawn.agentId,
+      status: "failed",
+      text: null,
+      usage: { input: 0, output: 0, cacheWrite: 0 },
+      error: "provider unavailable",
+    });
+    expect(emitted(harness, "subagents:failed")).toHaveLength(1);
+    expect(emitted(harness, "subagents:completed")).toHaveLength(0);
   });
 
   it("waitForAll snapshots every active managed completion and is safely repeatable", async () => {

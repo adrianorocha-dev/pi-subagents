@@ -489,7 +489,7 @@ Version 1 guarantees:
 - managed records stay in the shared manager, widget, and FleetView; `registerGroupProvider()` adds neutral nested group views to the shared `agents` widget;
 - `notification: "suppress"` suppresses the follow-up and, by default, parent `subagents:record` bookkeeping. Set `parentBookkeeping: "record"` to persist it independently;
 - `transcriptDirectory` must already exist and receives `<agentId>.jsonl`;
-- completion resolves to normalized terminal status, text, lifetime usage, and worktree data. `stop`, `get`, and `waitForAll` are idempotent.
+- completion resolves to normalized terminal status, text, lifetime usage, and worktree data only after the shared manager promise (including terminal events and cleanup) and all queued managed hooks settle. `stop(id)` synchronously reports whether cancellation was accepted but does not release completion; accepted cancellation normalizes the eventual status to `stopped`, and `waitForAll()` observes the same settlement boundary. `stop`, `get`, and `waitForAll` remain idempotent.
 
 The first/root activation owns the global symbol. Child activations cannot replace or release it, and root shutdown removes it. The exported TypeScript declarations are optional convenience; runtime discovery remains structural and does not require importing this package.
 

@@ -25,9 +25,8 @@ import type { AgentActivity } from "./ui/agent-widget.js";
 export const SUBAGENT_HOST_SYMBOL = Symbol.for("pi-subagents:host");
 export const SUBAGENT_HOST_VERSION = 1 as const;
 
-interface DeferredStop {
-  readonly promise: Promise<void>;
-  readonly resolve: () => void;
+interface ManagedCancellation {
+  accepted: boolean;
 }
 
 interface HostAgentState {
@@ -37,7 +36,7 @@ interface HostAgentState {
 
 interface ActiveManagedAgent {
   readonly completion: Promise<ManagedAgentCompletion>;
-  readonly stop: DeferredStop;
+  readonly cancellation: ManagedCancellation;
 }
 
 export interface SubagentHostDependencies {
@@ -49,22 +48,6 @@ export interface SubagentHostDependencies {
   readonly defaultMaxTurns: () => number | undefined;
   readonly onAgentTracked: (agentId: string, activity: AgentActivity) => void;
   readonly registerGroupProvider: (provider: AgentGroupProvider) => () => void;
-}
-
-function createStopDeferred(): DeferredStop {
-  let settled = false;
-  let resolvePromise: (() => void) | undefined;
-  const promise = new Promise<void>((resolve) => {
-    resolvePromise = resolve;
-  });
-  return {
-    promise,
-    resolve: () => {
-      if (settled) return;
-      settled = true;
-      resolvePromise?.();
-    },
-  };
 }
 
 function assertTranscriptDirectory(directory: string | undefined): void {
@@ -251,14 +234,12 @@ export class ManagedSubagentHost implements SubagentHostV1 {
 
     this.ownedAgentIds.add(agentId);
     this.state.set(agentId, hostState);
-    const stop = createStopDeferred();
-    const runCompletion = record.promise.then(async () => {
+    const cancellation: ManagedCancellation = { accepted: false };
+    const completion = record.promise.then(async () => {
       await hookQueue;
-      return completionOf(record);
+      return completionOf(record, cancellation.accepted ? "stopped" : undefined);
     });
-    const stoppedCompletion = stop.promise.then(() => completionOf(record, "stopped"));
-    const completion = Promise.race([runCompletion, stoppedCompletion]);
-    this.active.set(agentId, { completion, stop });
+    this.active.set(agentId, { completion, cancellation });
     void completion.then(
       () => this.active.delete(agentId),
       () => this.active.delete(agentId),
@@ -279,7 +260,7 @@ export class ManagedSubagentHost implements SubagentHostV1 {
   stop(agentId: string): boolean {
     const active = this.active.get(agentId);
     if (!active || !this.dependencies.manager.abort(agentId)) return false;
-    active.stop.resolve();
+    active.cancellation.accepted = true;
     return true;
   }
 

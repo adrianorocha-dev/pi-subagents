@@ -314,6 +314,7 @@ export interface ManagedAgentCompletion {
 
 export interface ManagedSpawn {
   readonly agentId: string;
+  /** Settles after the manager run, terminal cleanup, and queued managed hooks. */
   readonly completion: Promise<ManagedAgentCompletion>;
 }
 
@@ -346,8 +347,10 @@ export type AgentGroupProvider = () => readonly AgentGroupView[];
 export interface SubagentHostV1 {
   readonly version: 1;
   spawn(request: ManagedSpawnRequest, hooks?: ManagedSpawnHooks): ManagedSpawn;
+  /** Synchronously reports cancellation acceptance; completion still awaits terminal settlement. */
   stop(agentId: string): boolean;
   get(agentId: string): ManagedAgentSnapshot | undefined;
+  /** Awaits the same manager, cleanup, and managed-hook boundary as each completion. */
   waitForAll(): Promise<void>;
   registerGroupProvider(provider: AgentGroupProvider): () => void;
 }
