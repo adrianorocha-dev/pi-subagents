@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Versioned `SubagentHostV1` same-process contract for external controllers.** The root activation now publishes a structurally discoverable host at `Symbol.for("pi-subagents:host")` with normalized spawn/completion/snapshot/stop/wait operations and an `AgentWidget` group-provider seam. Managed spawns use the same extracted invocation policy as the `Agent` tool (case-insensitive type fallback, frontmatter authority, fuzzy models, model scope, thinking, turns, and worktree validation), while the controller-only embedded `general-purpose` selector ignores project overrides and disabled defaults. External queueing bypasses and is excluded from internal background concurrency accounting; records remain in the shared manager/FleetView; notification and parent-record suppression are independent; opaque metadata is retained on exactly-once lifecycle events; controller extension exclusions apply before child binding; awaited session configuration can mutate the supported tools/system-prompt/stream surface before the first prompt; caller-owned transcript directories receive `<agentId>.jsonl`; and terminal status, lifetime usage, text, and worktree data are normalized. The global slot is first-activation-owned and identity-released on root shutdown, matching the existing manager guard.
+
 ## [0.14.1] - 2026-07-14
 
 ### Added

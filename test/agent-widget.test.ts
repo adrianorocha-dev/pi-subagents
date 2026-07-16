@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
 import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatSessionTokens } from "../src/ui/agent-widget.js";
@@ -133,5 +133,91 @@ describe("AgentWidget", () => {
   it("renders nothing in 'off' mode", () => {
     const manager = { listAgents: () => [makeRecord("background", { isBackground: true })] };
     expect(renderLines(manager, "background", () => "off")).toBe("");
+  });
+
+  it("polls a registered provider so groups can appear before the first agent", () => {
+    vi.useFakeTimers();
+    try {
+      const manager = { listAgents: () => [] };
+      const widget = new AgentWidget(manager as any, new Map(), () => "background");
+      let factory: any;
+      let groups: Array<{ id: string; title: string; agentIds: string[] }> = [];
+      widget.setUICtx({
+        setStatus: () => {},
+        setWidget: (_key, content) => { factory = content; },
+      });
+      widget.registerGroupProvider(() => groups);
+      expect(factory).toBeUndefined();
+
+      groups = [{ id: "live", title: "Live workflow", agentIds: [] }];
+      vi.advanceTimersByTime(100);
+      expect(factory).toBeTypeOf("function");
+      widget.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps registered groups hidden when widget mode is off", () => {
+    const manager = { listAgents: () => [] };
+    const widget = new AgentWidget(manager as any, new Map(), () => "off");
+    let factory: any;
+    widget.setUICtx({
+      setStatus: () => {},
+      setWidget: (_key, content) => { factory = content; },
+    });
+    widget.registerGroupProvider(() => [{ id: "hidden", title: "Hidden", agentIds: [] }]);
+    widget.update();
+
+    expect(factory).toBeUndefined();
+    widget.dispose();
+  });
+
+  it("renders registered nested groups in provider order without duplicate agent rows", () => {
+    const first = makeRecord("first", { isBackground: true });
+    const second = makeRecord("second", { isBackground: true });
+    const manager = { listAgents: () => [first, second] };
+    const widget = new AgentWidget(
+      manager as any,
+      new Map([
+        [first.id, makeActivity()],
+        [second.id, makeActivity()],
+      ]),
+      () => "background",
+    );
+    let factory: any;
+    widget.setUICtx({
+      setStatus: () => {},
+      setWidget: (_key, content) => { factory = content; },
+    });
+    const unregister = widget.registerGroupProvider(() => [{
+      id: "workflow:run-1",
+      title: "Review workflow",
+      narrator: "checking changes",
+      agentIds: [second.id],
+      children: [{
+        id: "phase:verify",
+        title: "Verify",
+        detail: "2 calls",
+        agentIds: [first.id, second.id],
+      }],
+    }]);
+    widget.update();
+
+    const render = () => factory(
+      { terminal: { columns: 120 }, requestRender: () => {} },
+      theme,
+    ).render().join("\n");
+    const grouped = render();
+    expect(grouped).toContain("Review workflow");
+    expect(grouped).toContain("checking changes");
+    expect(grouped).toContain("Verify");
+    expect(grouped.indexOf("second description")).toBeLessThan(grouped.indexOf("first description"));
+    expect(grouped.match(/second description/g)).toHaveLength(1);
+
+    unregister();
+    unregister();
+    expect(render()).not.toContain("Review workflow");
+    widget.dispose();
   });
 });

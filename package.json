@@ -36,7 +36,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "vitest run e2e --reporter=verbose",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p test/declarations/tsconfig.json",
     "lint": "biome check src/ test/",
     "lint:fix": "biome check --fix src/ test/"
   },

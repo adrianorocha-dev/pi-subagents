@@ -126,6 +126,14 @@ export interface AgentRecord {
   isBackground?: boolean;
   /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
   invocation?: AgentInvocation;
+  /** External controllers bypass this package's background queue/accounting. */
+  queuePolicy?: "external";
+  /** Suppress the per-agent follow-up without changing lifecycle events. */
+  suppressNotification?: boolean;
+  /** Suppress the parent session's durable `subagents:record` entry. */
+  suppressParentRecord?: boolean;
+  /** Opaque controller data copied by reference onto lifecycle events. */
+  metadata?: Readonly<Record<string, unknown>>;
 }
 
 export interface AgentInvocation {
@@ -203,4 +211,143 @@ export interface ScheduleStoreData {
   /** For future migrations. */
   version: 1;
   jobs: ScheduledSubagent[];
+}
+
+// ---- Versioned same-process host contract ----
+
+export type ManagedThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type ManagedAgentStatus = "queued" | "running" | "completed" | "failed" | "stopped";
+export type ManagedAgentTerminalStatus = Extract<ManagedAgentStatus, "completed" | "failed" | "stopped">;
+
+export interface ManagedAgentUsage {
+  readonly input: number;
+  readonly output: number;
+  readonly cacheWrite: number;
+}
+
+export interface ManagedWorktreeResult {
+  readonly hasChanges: boolean;
+  readonly branch?: string;
+}
+
+export interface ManagedAgentActivity {
+  readonly type: "start" | "end";
+  readonly toolName: string;
+}
+
+export interface ManagedAgentTurn {
+  readonly turnCount: number;
+}
+
+export interface ManagedAgentCompaction {
+  readonly reason: "manual" | "threshold" | "overflow";
+  readonly tokensBefore: number;
+}
+
+export interface EmbeddedBaseConfig {
+  readonly source: "embedded";
+  readonly name: "general-purpose";
+}
+
+export interface ManagedSpawnRequestBase {
+  readonly prompt: string;
+  readonly description: string;
+  readonly model?: string;
+  readonly thinking?: ManagedThinkingLevel;
+  readonly maxTurns?: number;
+  readonly isolation?: "worktree";
+  readonly cwd?: string;
+  readonly queue: "external";
+  readonly notification: "suppress";
+  /** Defaults to `suppress` when notification is suppressed. */
+  readonly parentBookkeeping?: "record" | "suppress";
+  readonly metadata: Readonly<Record<string, unknown>>;
+  readonly excludeExtensions: readonly string[];
+  /** Existing directory; the host writes `<transcriptDirectory>/<agentId>.jsonl`. */
+  readonly transcriptDirectory?: string;
+  readonly groupId?: string;
+}
+
+export type ManagedSpawnRequest = ManagedSpawnRequestBase &
+  (
+    | { readonly agentType: string; readonly baseConfig?: never }
+    | { readonly agentType?: never; readonly baseConfig: EmbeddedBaseConfig }
+  );
+
+export interface ManagedChildTool {
+  readonly name: string;
+}
+
+export type ManagedChildStreamFn = (...args: never[]) => unknown;
+
+/** Supported mutable child surface passed after extension binding and before the first prompt. */
+export interface ManagedChildSession {
+  readonly agent: {
+    readonly state: {
+      tools: ManagedChildTool[];
+      systemPrompt: string;
+    };
+    streamFn: ManagedChildStreamFn;
+  };
+  prompt(text: string): Promise<void>;
+  steer(text: string): Promise<void>;
+  abort(): Promise<void>;
+  waitForIdle(): Promise<void>;
+}
+
+export interface ManagedSpawnHooks {
+  readonly configureSession?: (session: ManagedChildSession) => void | Promise<void>;
+  readonly onActivity?: (activity: ManagedAgentActivity) => void | Promise<void>;
+  readonly onTurn?: (turn: ManagedAgentTurn) => void | Promise<void>;
+  readonly onCompaction?: (compaction: ManagedAgentCompaction) => void | Promise<void>;
+  readonly onUsage?: (usage: ManagedAgentUsage) => void | Promise<void>;
+}
+
+export interface ManagedAgentCompletion {
+  readonly agentId: string;
+  readonly status: ManagedAgentTerminalStatus;
+  readonly text: string | null;
+  readonly usage: ManagedAgentUsage;
+  readonly error?: string;
+  readonly worktree?: ManagedWorktreeResult;
+}
+
+export interface ManagedSpawn {
+  readonly agentId: string;
+  readonly completion: Promise<ManagedAgentCompletion>;
+}
+
+export interface ManagedAgentSnapshot {
+  readonly agentId: string;
+  readonly description: string;
+  readonly status: ManagedAgentStatus;
+  readonly usage: ManagedAgentUsage;
+  readonly turnCount: number;
+  readonly compactionCount: number;
+  readonly metadata: Readonly<Record<string, unknown>>;
+  readonly startedAt: number;
+  readonly completedAt?: number;
+  readonly activity?: ManagedAgentActivity;
+  readonly error?: string;
+  readonly worktree?: ManagedWorktreeResult;
+}
+
+export interface AgentGroupView {
+  readonly id: string;
+  readonly title: string;
+  readonly detail?: string;
+  readonly narrator?: string;
+  readonly agentIds: readonly string[];
+  readonly children?: readonly AgentGroupView[];
+}
+
+export type AgentGroupProvider = () => readonly AgentGroupView[];
+
+export interface SubagentHostV1 {
+  readonly version: 1;
+  spawn(request: ManagedSpawnRequest, hooks?: ManagedSpawnHooks): ManagedSpawn;
+  stop(agentId: string): boolean;
+  get(agentId: string): ManagedAgentSnapshot | undefined;
+  waitForAll(): Promise<void>;
+  registerGroupProvider(provider: AgentGroupProvider): () => void;
 }
