@@ -863,6 +863,57 @@ describe("AgentManager — abortAll", () => {
   });
 });
 
+describe("AgentManager — external queue policy", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  it("starts externally queued agents immediately even when the managed queue is full", () => {
+    manager = new AgentManager(undefined, 1);
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+
+    const managed = manager.spawn(mockPi, mockCtx, "X", "managed", {
+      description: "managed",
+      isBackground: true,
+    });
+    const external = manager.spawn(mockPi, mockCtx, "Y", "external", {
+      description: "external",
+      isBackground: true,
+      queuePolicy: "external",
+    });
+
+    expect(manager.getRecord(managed)?.status).toBe("running");
+    expect(manager.getRecord(external)?.status).toBe("running");
+    manager.abort(managed);
+    manager.abort(external);
+  });
+
+  it("does not count external agents against subsequent managed background admission", () => {
+    manager = new AgentManager(undefined, 1);
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+
+    const external = manager.spawn(mockPi, mockCtx, "X", "external", {
+      description: "external",
+      isBackground: true,
+      queuePolicy: "external",
+    });
+    const managed = manager.spawn(mockPi, mockCtx, "Y", "managed", {
+      description: "managed",
+      isBackground: true,
+    });
+    const queued = manager.spawn(mockPi, mockCtx, "Z", "queued", {
+      description: "queued",
+      isBackground: true,
+    });
+
+    expect(manager.getRecord(external)?.status).toBe("running");
+    expect(manager.getRecord(managed)?.status).toBe("running");
+    expect(manager.getRecord(queued)?.status).toBe("queued");
+    manager.abort(external);
+    manager.abort(managed);
+    manager.abort(queued);
+  });
+});
+
 describe("AgentManager — hasRunning", () => {
   let manager: AgentManager;
   afterEach(() => manager?.dispose());

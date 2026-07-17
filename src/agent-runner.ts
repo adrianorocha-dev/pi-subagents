@@ -24,7 +24,7 @@ import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentConfig, SubagentType, ThinkingLevel } from "./types.js";
 
 /**
  * Tool names registered by THIS extension. Single source of truth so the
@@ -267,6 +267,12 @@ export interface RunOptions {
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
+  /** Registry-independent configuration used by controller-only base selectors. */
+  agentConfigOverride?: AgentConfig;
+  /** Operational denylist applied before resource binding; it wins over agent inclusion. */
+  controllerExtensionDenylist?: readonly string[];
+  /** Awaited after bindExtensions() and before onSessionCreated/the first prompt. */
+  configureSession?: (session: AgentSession) => void | Promise<void>;
   /** Override working directory (e.g. for worktree isolation). */
   cwd?: string;
   /**
@@ -394,6 +400,10 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
  */
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
+  if (signal.aborted) {
+    void session.abort();
+    return () => {};
+  }
   const onAbort = () => session.abort();
   signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
@@ -412,8 +422,18 @@ export async function runAgent(
   prompt: string,
   options: RunOptions,
 ): Promise<RunResult> {
-  const config = getConfig(type);
-  const agentConfig = getAgentConfig(type);
+  const agentConfig = options.agentConfigOverride ?? getAgentConfig(type);
+  const config = options.agentConfigOverride
+    ? {
+        displayName: agentConfig?.displayName ?? type,
+        description: agentConfig?.description ?? type,
+        builtinToolNames: agentConfig?.builtinToolNames ?? BUILTIN_TOOL_NAMES,
+        extensions: agentConfig?.extensions ?? true,
+        excludeExtensions: agentConfig?.excludeExtensions,
+        skills: agentConfig?.skills ?? true,
+        promptMode: agentConfig?.promptMode ?? "append" as const,
+      }
+    : getConfig(type);
 
   // Resolve working directory: worktree override > parent cwd
   const effectiveCwd = options.cwd ?? ctx.cwd;
@@ -444,7 +464,9 @@ export async function runAgent(
     }
   }
 
-  let toolNames = getToolNamesForType(type);
+  let toolNames = options.agentConfigOverride
+    ? agentConfig?.builtinToolNames ?? [...BUILTIN_TOOL_NAMES]
+    : getToolNamesForType(type);
 
   // Persistent memory: detect write capability and branch accordingly.
   // Account for disallowedTools — a tool in the base set but on the denylist is not truly available.
@@ -515,7 +537,12 @@ export async function runAgent(
   // Plain canonical names only (case-insensitive). Note: excluded extensions'
   // factories still run once during reload() (see comment above) — exclusion
   // suppresses handler binding and tool registration; it is not a sandbox.
-  const excludeNames = new Set((excludeExtensions ?? []).map((n) => n.toLowerCase()));
+  const configuredExcludeNames = new Set((excludeExtensions ?? []).map((n) => n.toLowerCase()));
+  const controllerExcludeNames = new Set(
+    (options.isolated ? [] : options.controllerExtensionDenylist ?? []).map((name) => name.toLowerCase()),
+  );
+  const excludeNames = new Set([...configuredExcludeNames, ...controllerExcludeNames]);
+  const hasConfiguredExcludes = configuredExcludeNames.size > 0;
   const hasExcludes = excludeNames.size > 0;
   // The override filters loaded extensions down to `keepNames` minus `excludeNames`.
   // It's only needed when we're neither loading everything without excludes
@@ -582,7 +609,7 @@ export async function runAgent(
   //     loading is `extensions:`-authoritative.
   // An exclude_extensions: alongside extensions: false is contradictory — nothing
   // loads, so there is nothing to exclude.
-  if (hasExcludes && noExtensions) {
+  if (hasConfiguredExcludes && noExtensions) {
     options.onToolActivity?.({
       type: "end",
       toolName: `extension-error:exclude_extensions has no effect for agent "${type}" — extensions: false loads nothing`,
@@ -591,8 +618,8 @@ export async function runAgent(
   // Exclude typo check: compares against the PRE-filter discovered set (an excluded
   // name absent from the surviving set is the exclude working as intended). Also
   // flags path-like and "*" entries — excludes are plain names only.
-  if (hasExcludes && discoveredNames) {
-    for (const name of excludeNames) {
+  if (hasConfiguredExcludes && discoveredNames) {
+    for (const name of configuredExcludeNames) {
       if (!discoveredNames.has(name)) {
         options.onToolActivity?.({
           type: "end",
@@ -607,6 +634,7 @@ export async function runAgent(
     );
     for (const name of keepNames) {
       if (!survivingNames.has(name)) {
+        if (controllerExcludeNames.has(name) && !configuredExcludeNames.has(name)) continue;
         options.onToolActivity?.({
           type: "end",
           toolName: excludeNames.has(name)
@@ -716,7 +744,11 @@ export async function runAgent(
     },
   });
 
+  await options.configureSession?.(session);
   options.onSessionCreated?.(session);
+  if (options.signal?.aborted) {
+    return { responseText: "", session, aborted: true, steered: false };
+  }
 
   // Track turns for graceful max_turns enforcement
   let turnCount = 0;

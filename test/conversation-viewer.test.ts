@@ -129,6 +129,45 @@ describe("ConversationViewer", () => {
       }
     });
 
+    it("neutralizes OSC 52, CSI, and C1 in conversation content before wrapping", () => {
+      const osc52 = "\x1b]52;c;Y2xpcGJvYXJkLXNlY3JldA==\x07";
+      const csi = "\x1b[2J";
+      const c1Csi = "\x9b31m";
+      const c1Osc52 = "\x9d52;c;QzEtY2xpcGJvYXJkLXNlY3JldA==\x9c";
+      const messages = [
+        { role: "user", content: `user λ${osc52} kept` },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: `assistant α\nkept${osc52} after${csi} clear${c1Csi} color${c1Osc52} tail` },
+            { type: "toolCall", toolUseId: "t1", name: `read${osc52}${csi}${c1Csi}`, input: {} },
+          ],
+        },
+        { role: "toolResult", toolUseId: "t1", content: [{ type: "text", text: `result 文${osc52}${csi}${c1Csi}${c1Osc52} kept` }] },
+        {
+          role: "bashExecution",
+          command: `printf shell${osc52}${csi}${c1Csi}`,
+          output: `shell output β${osc52}\nnext${csi}${c1Csi}${c1Osc52} line`,
+          exitCode: 0, cancelled: false, truncated: false, timestamp: Date.now(),
+        },
+      ];
+      const viewer = new ConversationViewer(
+        mockTui(80, 180), mockSession(messages), mockRecord({ status: "completed" }), undefined, ansiTheme(), vi.fn(),
+      );
+
+      const rendered = viewer.render(180).join("\n");
+      expect(rendered).toContain("assistant α");
+      expect(rendered).toContain("result 文");
+      expect(rendered).toContain("printf shell");
+      expect(rendered).toContain("shell output β");
+      expect(rendered).toContain("\x1b[38;5;240m"); // internally generated theme ANSI survives
+      expect(rendered).not.toContain("Y2xpcGJvYXJkLXNlY3JldA==");
+      expect(rendered).not.toContain("QzEtY2xpcGJvYXJkLXNlY3JldA==");
+      expect(rendered).not.toContain("\x1b]52");
+      expect(rendered).not.toContain("\x1b[2J");
+      expect(rendered).not.toMatch(/[\u0080-\u009f]/u);
+    });
+
     it("no line exceeds width with long URLs", () => {
       const url = "https://example.com/" + "a/b/c/d/e/".repeat(30) + "?q=" + "x".repeat(100);
       const messages = [

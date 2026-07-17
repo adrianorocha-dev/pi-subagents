@@ -8,8 +8,16 @@
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { AgentManager } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
-import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
+import type {
+  AgentGroupProvider,
+  AgentGroupView,
+  AgentInvocation,
+  AgentRecord,
+  SubagentType,
+  WidgetMode,
+} from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
+import { cleanUiText } from "./terminal-controls.js";
 
 // ---- Constants ----
 
@@ -151,7 +159,7 @@ export function formatDuration(startedAt: number, completedAt?: number): string 
 
 /** Get display name for any agent type (built-in or custom). */
 export function getDisplayName(type: SubagentType): string {
-  return getConfig(type).displayName;
+  return cleanUiText(getConfig(type).displayName);
 }
 
 /** Short label for prompt mode: "twin" for append, nothing for replace (the default). */
@@ -177,7 +185,7 @@ export function buildInvocationTags(
 
 /** Truncate text to a single line, max `len` chars. */
 function truncateLine(text: string, len = 60): string {
-  const line = text.split("\n").find(l => l.trim())?.trim() ?? "";
+  const line = cleanUiText(text);
   if (line.length <= len) return line;
   return line.slice(0, len) + "…";
 }
@@ -187,7 +195,7 @@ export function describeActivity(activeTools: Map<string, string>, responseText?
   if (activeTools.size > 0) {
     const groups = new Map<string, number>();
     for (const toolName of activeTools.values()) {
-      const action = TOOL_DISPLAY[toolName] ?? toolName;
+      const action = cleanUiText(TOOL_DISPLAY[toolName] ?? toolName);
       groups.set(action, (groups.get(action) ?? 0) + 1);
     }
 
@@ -227,6 +235,8 @@ export class AgentWidget {
   private tui: any | undefined;
   /** Last status bar text, used to avoid redundant setStatus calls. */
   private lastStatusText: string | undefined;
+  private readonly groupProviders = new Map<number, AgentGroupProvider>();
+  private nextGroupProviderId = 1;
 
   constructor(
     private manager: AgentManager,
@@ -257,6 +267,32 @@ export class AgentWidget {
       case "background": return all.filter(a => a.isBackground !== false);
       default: return all;
     }
+  }
+
+  /** Register neutral grouping data without exposing widget implementation details. */
+  registerGroupProvider(provider: AgentGroupProvider): () => void {
+    const id = this.nextGroupProviderId++;
+    this.groupProviders.set(id, provider);
+    this.update();
+    let registered = true;
+    return () => {
+      if (!registered) return;
+      registered = false;
+      this.groupProviders.delete(id);
+      this.update();
+    };
+  }
+
+  private readGroups(): readonly AgentGroupView[] {
+    const groups: AgentGroupView[] = [];
+    for (const provider of this.groupProviders.values()) {
+      try {
+        groups.push(...provider());
+      } catch {
+        // A presentation provider cannot break the shared agent widget.
+      }
+    }
+    return groups;
   }
 
   /** Set the UI context (grabbed from first tool execution). */
@@ -324,7 +360,8 @@ export class AgentWidget {
       statusText = theme.fg("dim", " stopped");
     } else if (a.status === "error") {
       icon = theme.fg("error", "✗");
-      const errMsg = a.error ? `: ${a.error.slice(0, 60)}` : "";
+      const error = cleanUiText(a.error ?? "");
+      const errMsg = error ? `: ${error.slice(0, 60)}` : "";
       statusText = theme.fg("error", ` error${errMsg}`);
     } else {
       // aborted
@@ -339,7 +376,7 @@ export class AgentWidget {
     parts.push(duration);
 
     const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-    return `${icon} ${theme.fg("dim", name)}${modeTag}  ${theme.fg("dim", a.description)} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
+    return `${icon} ${theme.fg("dim", name)}${modeTag}  ${theme.fg("dim", cleanUiText(a.description))} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
   }
 
   /**
@@ -357,9 +394,14 @@ export class AgentWidget {
 
     const hasActive = running.length > 0 || queued.length > 0;
     const hasFinished = finished.length > 0;
+    const groups = this.mode() === "off" ? [] : this.readGroups();
 
     // Nothing to show — return empty (widget will be unregistered by update())
-    if (!hasActive && !hasFinished) return [];
+    if (!hasActive && !hasFinished && groups.length === 0) return [];
+
+    if (groups.length > 0) {
+      return this.renderGroupedWidget(allAgents, groups, tui, theme);
+    }
 
     const w = tui.terminal.columns;
     const truncate = (line: string) => truncateToWidth(line, w);
@@ -398,7 +440,7 @@ export class AgentWidget {
       const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
 
       runningLines.push([
-        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
+        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", cleanUiText(a.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
         truncate(theme.fg("dim", "│  ") + theme.fg("dim", `  ⎿  ${activity}`)),
       ]);
     }
@@ -478,6 +520,99 @@ export class AgentWidget {
     return lines;
   }
 
+  private renderGroupedWidget(
+    allAgents: AgentRecord[],
+    groups: readonly AgentGroupView[],
+    tui: any,
+    theme: Theme,
+  ): string[] {
+    const eligible = allAgents.filter((agent) =>
+      agent.status === "running" ||
+      agent.status === "queued" ||
+      (agent.completedAt !== undefined && this.shouldShowFinished(agent.id, agent.status)),
+    );
+    const byId = new Map(eligible.map((agent) => [agent.id, agent]));
+    const seen = new Set<string>();
+    const frame = SPINNER[this.widgetFrame % SPINNER.length];
+    const width = tui.terminal.columns;
+    const truncate = (line: string) => truncateToWidth(line, width);
+    const items: string[][] = [];
+
+    const renderAgent = (agent: AgentRecord, depth: number): string[] => {
+      const indent = "  ".repeat(depth);
+      if (agent.status === "queued") {
+        return [truncate(`${indent}${theme.fg("muted", "◦")} ${theme.fg("dim", getDisplayName(agent.type))}  ${theme.fg("muted", cleanUiText(agent.description))}`)];
+      }
+      if (agent.status !== "running") {
+        return [truncate(`${indent}${this.renderFinishedLine(agent, theme)}`)];
+      }
+
+      const activity = this.agentActivity.get(agent.id);
+      const toolUses = activity?.toolUses ?? agent.toolUses;
+      const tokens = getLifetimeTotal(activity?.lifetimeUsage);
+      const contextPercent = getSessionContextPercent(activity?.session);
+      const tokenText = tokens > 0
+        ? formatSessionTokens(tokens, contextPercent, theme, agent.compactionCount)
+        : "";
+      const parts: string[] = [];
+      if (activity) parts.push(formatTurns(activity.turnCount, activity.maxTurns));
+      if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
+      if (tokenText) parts.push(tokenText);
+      parts.push(formatMs(Date.now() - agent.startedAt));
+      const modeLabel = getPromptModeLabel(agent.type);
+      const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
+      const activityText = activity ? describeActivity(activity.activeTools, activity.responseText) : "thinking…";
+      return [
+        truncate(`${indent}${theme.fg("accent", frame)} ${theme.bold(getDisplayName(agent.type))}${modeTag}  ${theme.fg("muted", cleanUiText(agent.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", parts.join(" · "))}`),
+        truncate(`${indent}  ${theme.fg("dim", `⎿  ${activityText}`)}`),
+      ];
+    };
+
+    const addGroup = (group: AgentGroupView, depth: number): void => {
+      const detail = group.detail ? ` ${theme.fg("dim", cleanUiText(group.detail))}` : "";
+      const narrator = group.narrator ? ` ${theme.fg("muted", `· ${cleanUiText(group.narrator)}`)}` : "";
+      items.push([truncate(`${"  ".repeat(depth)}${theme.fg("accent", "◇")} ${theme.bold(cleanUiText(group.title))}${detail}${narrator}`)]);
+      for (const agentId of group.agentIds) {
+        if (seen.has(agentId)) continue;
+        const agent = byId.get(agentId);
+        if (!agent) continue;
+        seen.add(agentId);
+        items.push(renderAgent(agent, depth + 1));
+      }
+      for (const child of group.children ?? []) addGroup(child, depth + 1);
+    };
+
+    for (const group of groups) addGroup(group, 0);
+    for (const agent of eligible) {
+      if (seen.has(agent.id)) continue;
+      seen.add(agent.id);
+      items.push(renderAgent(agent, 0));
+    }
+
+    const hasActive = eligible.some((agent) => agent.status === "running" || agent.status === "queued");
+    const headingColor = hasActive ? "accent" : "dim";
+    const headingIcon = hasActive ? "●" : "○";
+    const lines = [truncate(`${theme.fg(headingColor, headingIcon)} ${theme.fg(headingColor, "Agents")}`)];
+    const totalBodyLines = items.reduce((total, item) => total + item.length, 0);
+    if (totalBodyLines <= MAX_WIDGET_LINES - 1) {
+      for (const item of items) lines.push(...item);
+      return lines;
+    }
+
+    let budget = MAX_WIDGET_LINES - 2;
+    let hidden = 0;
+    for (const item of items) {
+      if (item.length <= budget) {
+        lines.push(...item);
+        budget -= item.length;
+      } else {
+        hidden++;
+      }
+    }
+    lines.push(truncate(`${theme.fg("dim", "└─")} ${theme.fg("dim", `+${hidden} more`)}`));
+    return lines;
+  }
+
   /** Force an immediate widget update. */
   update() {
     if (!this.uiCtx) return;
@@ -493,9 +628,12 @@ export class AgentWidget {
       else if (a.completedAt && this.shouldShowFinished(a.id, a.status)) { hasFinished = true; }
     }
     const hasActive = runningCount > 0 || queuedCount > 0;
+    const groupsEnabled = this.mode() !== "off";
+    const hasGroupProviders = groupsEnabled && this.groupProviders.size > 0;
+    const hasGroups = groupsEnabled && this.readGroups().length > 0;
 
     // Nothing to show — clear widget
-    if (!hasActive && !hasFinished) {
+    if (!hasActive && !hasFinished && !hasGroups) {
       if (this.widgetRegistered) {
         this.uiCtx.setWidget("agents", undefined);
         this.widgetRegistered = false;
@@ -505,13 +643,20 @@ export class AgentWidget {
         this.uiCtx.setStatus("subagents", undefined);
         this.lastStatusText = undefined;
       }
-      if (this.widgetInterval) { clearInterval(this.widgetInterval); this.widgetInterval = undefined; }
+      if (hasGroupProviders) {
+        this.ensureTimer();
+      } else if (this.widgetInterval) {
+        clearInterval(this.widgetInterval);
+        this.widgetInterval = undefined;
+      }
       // Clean up stale entries
       for (const [id] of this.finishedTurnAge) {
         if (!allAgents.some(a => a.id === id)) this.finishedTurnAge.delete(id);
       }
       return;
     }
+
+    if (hasGroups) this.ensureTimer();
 
     // Status bar — only call setStatus when the text actually changes
     let newStatusText: string | undefined;
@@ -562,5 +707,6 @@ export class AgentWidget {
     this.widgetRegistered = false;
     this.tui = undefined;
     this.lastStatusText = undefined;
+    this.groupProviders.clear();
   }
 }

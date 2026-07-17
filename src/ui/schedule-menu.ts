@@ -11,6 +11,7 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { SubagentScheduler } from "../schedule.js";
 import type { ScheduledSubagent } from "../types.js";
+import { cleanUiText } from "./terminal-controls.js";
 
 /** Format an ISO timestamp as relative time ("in 4h", "2d ago", "—"). */
 function relTime(iso: string | undefined, now = Date.now()): string {
@@ -42,9 +43,9 @@ function formatJob(j: ScheduledSubagent, scheduler: SubagentScheduler): string {
   const next = scheduler.getNextRun(j.id);
   return [
     statusIcon(j),
-    j.name.padEnd(18).slice(0, 18),
-    j.schedule.padEnd(14).slice(0, 14),
-    `[${j.subagent_type}]`,
+    cleanUiText(j.name).padEnd(18).slice(0, 18),
+    cleanUiText(j.schedule).padEnd(14).slice(0, 14),
+    `[${cleanUiText(j.subagent_type)}]`,
     `next ${relTime(next)}`,
     `last ${relTime(j.lastRun)}`,
     `runs ${j.runCount}`,
@@ -54,14 +55,15 @@ function formatJob(j: ScheduledSubagent, scheduler: SubagentScheduler): string {
 /** Multi-line details block for the cancel confirm. */
 function formatDetails(j: ScheduledSubagent, scheduler: SubagentScheduler): string {
   const next = scheduler.getNextRun(j.id) ?? "—";
+  const prompt = cleanUiText(j.prompt);
   return [
-    `name:      ${j.name}`,
-    `schedule:  ${j.schedule} (${j.scheduleType})`,
-    `agent:     ${j.subagent_type}`,
-    `prompt:    ${j.prompt.slice(0, 200)}${j.prompt.length > 200 ? "…" : ""}`,
-    `created:   ${j.createdAt}`,
-    `last run:  ${j.lastRun ?? "—"} (${j.lastStatus ?? "—"})`,
-    `next run:  ${next}`,
+    `name:      ${cleanUiText(j.name)}`,
+    `schedule:  ${cleanUiText(j.schedule)} (${j.scheduleType})`,
+    `agent:     ${cleanUiText(j.subagent_type)}`,
+    `prompt:    ${prompt.slice(0, 200)}${prompt.length > 200 ? "…" : ""}`,
+    `created:   ${cleanUiText(j.createdAt)}`,
+    `last run:  ${cleanUiText(j.lastRun ?? "—")} (${j.lastStatus ?? "—"})`,
+    `next run:  ${cleanUiText(next)}`,
     `runs:      ${j.runCount}`,
   ].join("\n");
 }
@@ -96,9 +98,9 @@ export async function showSchedulesMenu(
   if (idx < 0) return;
   const job = jobs[idx];
 
-  const ok = await ctx.ui.confirm(`Cancel "${job.name}"?`, formatDetails(job, scheduler));
+  const ok = await ctx.ui.confirm(`Cancel "${cleanUiText(job.name)}"?`, formatDetails(job, scheduler));
   if (!ok) return;
 
   scheduler.removeJob(job.id);
-  ctx.ui.notify(`Cancelled "${job.name}".`, "info");
+  ctx.ui.notify(`Cancelled "${cleanUiText(job.name)}".`, "info");
 }

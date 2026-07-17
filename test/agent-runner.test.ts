@@ -121,6 +121,10 @@ function createSession(finalText: string) {
   const listeners: Array<(event: any) => void> = [];
   const session = {
     messages: [] as any[],
+    agent: {
+      state: { tools: [{ name: "read" }], systemPrompt: "initial system prompt" },
+      streamFn: vi.fn(() => undefined),
+    },
     subscribe: vi.fn((listener: (event: any) => void) => {
       listeners.push(listener);
       return () => {};
@@ -187,6 +191,67 @@ describe("agent-runner final output capture", () => {
     const bindOrder = session.bindExtensions.mock.invocationCallOrder[0];
     const promptOrder = session.prompt.mock.invocationCallOrder[0];
     expect(bindOrder).toBeLessThan(promptOrder);
+  });
+
+  it("awaits supported child-session mutations after binding and before the first prompt", async () => {
+    const { session } = createSession("CONFIGURED");
+    const order: string[] = [];
+    session.bindExtensions.mockImplementation(async () => {
+      order.push("extensions-bound");
+    });
+    session.prompt.mockImplementation(async () => {
+      order.push("prompt");
+      expect(session.agent.state.tools).toEqual([{ name: "StructuredOutput" }]);
+      expect(session.agent.state.systemPrompt).toBe("configured system prompt");
+      await session.agent.streamFn();
+      session.messages.push({ role: "assistant", content: [{ type: "text", text: "CONFIGURED" }] });
+    });
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", {
+      pi,
+      configureSession: async (child) => {
+        order.push("configure:start");
+        await Promise.resolve();
+        child.agent.state.tools = [{ name: "StructuredOutput" }] as never;
+        child.agent.state.systemPrompt = "configured system prompt";
+        const original = child.agent.streamFn;
+        child.agent.streamFn = ((...args: Parameters<typeof original>) => {
+          order.push("provider");
+          return original(...args);
+        }) as typeof original;
+        order.push("configure:end");
+      },
+    });
+
+    expect(order).toEqual([
+      "extensions-bound",
+      "configure:start",
+      "configure:end",
+      "prompt",
+      "provider",
+    ]);
+  });
+
+  it("does not issue the first prompt when stopped during async session configuration", async () => {
+    const { session } = createSession("SHOULD NOT RUN");
+    createAgentSession.mockResolvedValue({ session });
+    const controller = new AbortController();
+    const onSessionCreated = vi.fn();
+
+    const result = await runAgent(ctx, "Explore", "go", {
+      pi,
+      signal: controller.signal,
+      configureSession: async () => {
+        await Promise.resolve();
+        controller.abort();
+      },
+      onSessionCreated,
+    });
+
+    expect(result).toMatchObject({ responseText: "", aborted: true, steered: false });
+    expect(onSessionCreated).toHaveBeenCalledWith(session);
+    expect(session.prompt).not.toHaveBeenCalled();
   });
 
   it("passes effective cwd and agentDir to the loader and settings manager", async () => {
@@ -1285,6 +1350,28 @@ describe("agent-runner exclude_extensions", () => {
 
     expect(lastToolsPassed()).not.toContain("mcp_tool");
     expect(extensionErrors(onToolActivity)).toEqual([]);
+  });
+
+  it("applies the controller denylist before binding and over custom inclusion", async () => {
+    setupAgent({ extensions: ["pi-workflows", "mcp"] });
+    withExtensions({
+      "/ext/pi-workflows.ts": ["Workflow"],
+      "/ext/mcp.ts": ["mcp_tool"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", {
+      pi,
+      controllerExtensionDenylist: ["PI-WORKFLOWS"],
+      onToolActivity,
+    });
+
+    expect(lastToolsPassed()).not.toContain("Workflow");
+    expect(lastToolsPassed()).toContain("mcp_tool");
+    expect(extensionErrors(onToolActivity)).toEqual([]);
+    expect(session.bindExtensions).toHaveBeenCalledOnce();
   });
 });
 

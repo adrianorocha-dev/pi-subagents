@@ -1,6 +1,6 @@
 import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
 
-interface AgentInvocationParams {
+export interface AgentInvocationParams {
   model?: string;
   thinking?: string;
   max_turns?: number;
@@ -10,10 +10,7 @@ interface AgentInvocationParams {
   isolation?: IsolationMode;
 }
 
-export function resolveAgentInvocationConfig(
-  agentConfig: AgentConfig | undefined,
-  params: AgentInvocationParams,
-): {
+export interface ResolvedAgentInvocationConfig {
   modelInput?: string;
   modelFromParams: boolean;
   thinking?: ThinkingLevel;
@@ -22,7 +19,12 @@ export function resolveAgentInvocationConfig(
   runInBackground: boolean;
   isolated: boolean;
   isolation?: IsolationMode;
-} {
+}
+
+export function resolveAgentInvocationConfig(
+  agentConfig: AgentConfig | undefined,
+  params: AgentInvocationParams,
+): ResolvedAgentInvocationConfig {
   return {
     modelInput: agentConfig?.model ?? params.model,
     modelFromParams: agentConfig?.model == null && params.model != null,

@@ -21,6 +21,7 @@
     "autonomous"
   ],
   "peerDependencies": {
+    "@earendil-works/pi-agent-core": ">=0.80.0",
     "@earendil-works/pi-ai": ">=0.80.0",
     "@earendil-works/pi-coding-agent": ">=0.80.0",
     "@earendil-works/pi-tui": ">=0.80.0"
@@ -36,7 +37,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "vitest run e2e --reporter=verbose",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p test/declarations/tsconfig.json",
     "lint": "biome check src/ test/",
     "lint:fix": "biome check --fix src/ test/"
   },

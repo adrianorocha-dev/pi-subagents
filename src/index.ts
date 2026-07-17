@@ -15,21 +15,23 @@ import { join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { createActivityTracker } from "./agent-activity.js";
 import { AgentManager } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
-import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, registerAgents, resolveType, setDefaultsDisabled } from "./agent-types.js";
+import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns } from "./agent-runner.js";
+import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, registerAgents, setDefaultsDisabled } from "./agent-types.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
-import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
 import { GroupJoinManager } from "./group-join.js";
-import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
+import { resolveJoinMode } from "./invocation-config.js";
+import { resolveAgentInvocationPolicy } from "./invocation-policy.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getStatusNote } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
+import { ManagedSubagentHost, SUBAGENT_HOST_SYMBOL } from "./subagent-host.js";
+import { type AgentConfig, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
 import {
   type AgentActivity,
   type AgentDetails,
@@ -49,7 +51,40 @@ import {
 } from "./ui/agent-widget.js";
 import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
-import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
+import { cleanUiLines, cleanUiText } from "./ui/terminal-controls.js";
+import { getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
+
+export { SUBAGENT_HOST_SYMBOL, SUBAGENT_HOST_VERSION } from "./subagent-host.js";
+export type {
+  AgentGroupProvider,
+  AgentGroupView,
+  EmbeddedBaseConfig,
+  ManagedAgentActivity,
+  ManagedAgentCompaction,
+  ManagedAgentCompletion,
+  ManagedAgentSnapshot,
+  ManagedAgentStatus,
+  ManagedAgentTerminalStatus,
+  ManagedAgentTurn,
+  ManagedAgentUsage,
+  ManagedChildAgentEventListener,
+  ManagedChildBeforeToolCall,
+  ManagedChildModel,
+  ManagedChildSession,
+  ManagedChildStream,
+  ManagedChildStreamContext,
+  ManagedChildStreamFn,
+  ManagedChildStreamOptions,
+  ManagedChildStreamResult,
+  ManagedChildTool,
+  ManagedSpawn,
+  ManagedSpawnHooks,
+  ManagedSpawnRequest,
+  ManagedSpawnRequestBase,
+  ManagedThinkingLevel,
+  ManagedWorktreeResult,
+  SubagentHostV1,
+} from "./types.js";
 
 // ---- Shared helpers ----
 
@@ -74,53 +109,6 @@ export function renderRunningAgentStatus(
 function formatLifetimeTokens(o: { lifetimeUsage: LifetimeUsage }): string {
   const t = getLifetimeTotal(o.lifetimeUsage);
   return t > 0 ? formatTokens(t) : "";
-}
-
-/**
- * Create an AgentActivity state and spawn callbacks for tracking tool usage.
- * Used by both foreground and background paths to avoid duplication.
- */
-function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
-  const state: AgentActivity = {
-    activeTools: new Map(),
-    toolUses: 0,
-    turnCount: 1,
-    maxTurns,
-    responseText: "",
-    session: undefined,
-    lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
-  };
-
-  const callbacks = {
-    onToolActivity: (activity: { type: "start" | "end"; toolName: string }) => {
-      if (activity.type === "start") {
-        state.activeTools.set(activity.toolName + "_" + Date.now(), activity.toolName);
-      } else {
-        for (const [key, name] of state.activeTools) {
-          if (name === activity.toolName) { state.activeTools.delete(key); break; }
-        }
-        state.toolUses++;
-      }
-      onStreamUpdate?.();
-    },
-    onTextDelta: (_delta: string, fullText: string) => {
-      state.responseText = fullText;
-      onStreamUpdate?.();
-    },
-    onTurnEnd: (turnCount: number) => {
-      state.turnCount = turnCount;
-      onStreamUpdate?.();
-    },
-    onSessionCreated: (session: any) => {
-      state.session = session;
-    },
-    onAssistantUsage: (usage: { input: number; output: number; cacheWrite: number }) => {
-      addUsage(state.lifetimeUsage, usage);
-      onStreamUpdate?.();
-    },
-  };
-
-  return { state, callbacks };
 }
 
 /**
@@ -211,22 +199,23 @@ function buildDetails(
 function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, activity?: AgentActivity): NotificationDetails {
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
 
+  const safeResult = record.result ? cleanUiLines(record.result) : "No output.";
+  const resultPreview = safeResult.length > resultMaxLen
+    ? safeResult.slice(0, resultMaxLen) + "…"
+    : safeResult;
+
   return {
-    id: record.id,
-    description: record.description,
-    status: record.status,
+    id: cleanUiText(record.id),
+    description: cleanUiText(record.description),
+    status: cleanUiText(record.status),
     toolUses: record.toolUses,
     turnCount: activity?.turnCount ?? 0,
     maxTurns: activity?.maxTurns,
     totalTokens,
     durationMs: record.completedAt ? record.completedAt - record.startedAt : 0,
-    outputFile: record.outputFile,
-    error: record.error,
-    resultPreview: record.result
-      ? record.result.length > resultMaxLen
-        ? record.result.slice(0, resultMaxLen) + "…"
-        : record.result
-      : "No output.",
+    outputFile: record.outputFile ? cleanUiText(record.outputFile) : undefined,
+    error: record.error ? cleanUiText(record.error) : undefined,
+    resultPreview: cleanUiLines(resultPreview),
   };
 }
 
@@ -239,14 +228,16 @@ export default function (pi: ExtensionAPI) {
       if (!d) return undefined;
 
       function renderOne(d: NotificationDetails): string {
-        const isError = d.status === "error" || d.status === "stopped" || d.status === "aborted";
+        const status = cleanUiText(d.status);
+        const description = cleanUiText(d.description);
+        const isError = status === "error" || status === "stopped" || status === "aborted";
         const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-        const statusText = isError ? d.status
-          : d.status === "steered" ? "completed (steered)"
+        const statusText = isError ? status
+          : status === "steered" ? "completed (steered)"
           : "completed";
 
         // Line 1: icon + agent description + status
-        let line = `${icon} ${theme.bold(d.description)} ${theme.fg("dim", statusText)}`;
+        let line = `${icon} ${theme.bold(description)} ${theme.fg("dim", statusText)}`;
 
         // Line 2: stats
         const parts: string[] = [];
@@ -259,17 +250,18 @@ export default function (pi: ExtensionAPI) {
         }
 
         // Line 3: result preview (collapsed) or full (expanded)
+        const resultPreview = cleanUiLines(d.resultPreview);
         if (expanded) {
-          const lines = d.resultPreview.split("\n").slice(0, 30);
+          const lines = resultPreview.split("\n").slice(0, 30);
           for (const l of lines) line += "\n" + theme.fg("dim", `  ${l}`);
         } else {
-          const preview = d.resultPreview.split("\n")[0]?.slice(0, 80) ?? "";
+          const preview = resultPreview.split("\n")[0]?.slice(0, 80) ?? "";
           line += "\n  " + theme.fg("dim", `⎿  ${preview}`);
         }
 
         // Line 4: output file link (if present)
         if (d.outputFile) {
-          line += "\n  " + theme.fg("muted", `transcript: ${d.outputFile}`);
+          line += "\n  " + theme.fg("muted", `transcript: ${cleanUiText(d.outputFile)}`);
         }
 
         return line;
@@ -393,6 +385,7 @@ export default function (pi: ExtensionAPI) {
       toolUses: record.toolUses,
       durationMs,
       tokens,
+      ...(record.metadata === undefined ? {} : { metadata: record.metadata }),
     };
   }
 
@@ -407,15 +400,18 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:completed", eventData);
     }
 
-    // Persist final record for cross-extension history reconstruction
-    pi.appendEntry("subagents:record", {
-      id: record.id, type: record.type, description: record.description,
-      status: record.status, result: record.result, error: record.error,
-      startedAt: record.startedAt, completedAt: record.completedAt,
-    });
+    // Persist final record for cross-extension history reconstruction unless
+    // an external controller owns durable bookkeeping.
+    if (!record.suppressParentRecord) {
+      pi.appendEntry("subagents:record", {
+        id: record.id, type: record.type, description: record.description,
+        status: record.status, result: record.result, error: record.error,
+        startedAt: record.startedAt, completedAt: record.completedAt,
+      });
+    }
 
-    // Skip notification if result was already consumed via get_subagent_result
-    if (record.resultConsumed) {
+    // Notification suppression is independent from parent-record persistence.
+    if (record.resultConsumed || record.suppressNotification) {
       agentActivity.delete(record.id);
       widget.markFinished(record.id);
       fleet.onAgentFinished(record.id);
@@ -443,6 +439,7 @@ export default function (pi: ExtensionAPI) {
       id: record.id,
       type: record.type,
       description: record.description,
+      ...(record.metadata === undefined ? {} : { metadata: record.metadata }),
     });
   }, (record, info) => {
     // Emit compacted event when agent's session compacts (preserves count on record).
@@ -453,6 +450,13 @@ export default function (pi: ExtensionAPI) {
       reason: info.reason,
       tokensBefore: info.tokensBefore,
       compactionCount: record.compactionCount,
+      ...(record.metadata === undefined ? {} : { metadata: record.metadata }),
+    });
+  }, (record, message) => {
+    pi.events.emit("subagents:steered", {
+      id: record.id,
+      message,
+      ...(record.metadata === undefined ? {} : { metadata: record.metadata }),
     });
   });
 
@@ -480,6 +484,8 @@ export default function (pi: ExtensionAPI) {
 
   // --- Cross-extension RPC via pi.events ---
   let currentCtx: ExtensionContext | undefined;
+  let managedHost: ManagedSubagentHost | undefined;
+  let ownsHostRegistry = false;
   // RPC handlers + the `subagents:ready` broadcast are wired on `session_start`
   // (a bound lifecycle event), not at factory time. pi runs every extension
   // factory before the `extensions:` filter and only fires lifecycle events for
@@ -516,18 +522,17 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
     manager.clearCompleted(true);
-    // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
-    // fires once per activation, but a double-bind must not leak listeners.
-    if (!rpcHandle) {
+    // Only the first activation whose session_start actually binds may claim
+    // the root host, RPC channels, and readiness broadcast. Factory-only
+    // activations and later child sessions stay silent on the shared bus.
+    if (!rpcHandle && claimManagedHost()) {
       rpcHandle = registerRpcHandlers({
         events: pi.events,
         pi,
         getCtx: () => currentCtx,
         manager,
       });
-      // Broadcast readiness so extensions loaded alongside us can discover us.
-      // Emitting after all factories have run (rather than at factory time)
-      // also avoids the race where a consumer loaded after us misses the event.
+      // The host slot and RPC listeners are live before consumers see ready.
       pi.events.emit("subagents:ready", {});
     }
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
@@ -545,6 +550,10 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
     rpcHandle = undefined;
+    managedHost?.dispose();
+    if (ownsHostRegistry && Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL) === managedHost) {
+      Reflect.deleteProperty(globalThis, SUBAGENT_HOST_SYMBOL);
+    }
     currentCtx = undefined;
     // Only release the global slot if this activation claimed it — a child
     // session's shutdown must not delete the root session's registry entry.
@@ -555,6 +564,7 @@ export default function (pi: ExtensionAPI) {
     manager.abortAll();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
+    widget.dispose();
     fleet.dispose();
     manager.dispose();
   });
@@ -732,6 +742,38 @@ export default function (pi: ExtensionAPI) {
     },
     (event, payload) => pi.events.emit(event, payload),
   );
+
+  /** Claim the host slot only from a bound root session_start. */
+  function claimManagedHost(): boolean {
+    if (managedHost !== undefined) {
+      return ownsHostRegistry && Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL) === managedHost;
+    }
+    if (Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL) !== undefined) return false;
+
+    const host = new ManagedSubagentHost({
+      pi,
+      manager,
+      getContext: () => currentCtx,
+      reloadAgents: reloadCustomAgents,
+      scopeModels: isScopeModelsEnabled,
+      defaultMaxTurns: getDefaultMaxTurns,
+      onAgentTracked: (agentId, activity) => {
+        agentActivity.set(agentId, activity);
+        widget.ensureTimer();
+        widget.update();
+        fleet.ensureTimer();
+        fleet.update();
+      },
+      registerGroupProvider: (provider) => widget.registerGroupProvider(provider),
+    });
+    if (!Reflect.set(globalThis, SUBAGENT_HOST_SYMBOL, host) || Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL) !== host) {
+      host.dispose();
+      return false;
+    }
+    managedHost = host;
+    ownsHostRegistry = true;
+    return true;
+  }
 
   // ---- Agent tool ----
 
@@ -932,40 +974,40 @@ Terse command-style prompts produce shallow, generic work.
 
     renderCall(args, theme) {
       const displayName = args.subagent_type ? getDisplayName(args.subagent_type) : "Agent";
-      const desc = args.description ?? "";
-      return new Text("▸ " + theme.fg("toolTitle", theme.bold(displayName)) + (desc ? "  " + theme.fg("muted", desc) : ""), 0, 0);
+      const description = cleanUiText(args.description ?? "");
+      return new Text("▸ " + theme.fg("toolTitle", theme.bold(displayName)) + (description ? "  " + theme.fg("muted", description) : ""), 0, 0);
     },
 
     renderResult(result, { expanded, isPartial }, theme) {
       const details = result.details as AgentDetails | undefined;
       if (!details) {
         const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-        return new Text(text, 0, 0);
+        return new Text(cleanUiLines(text), 0, 0);
       }
 
       // Helper: build "haiku · thinking: high · ↻5≤30 · 3 tool uses · 33.8k tokens" stats string
       const stats = (d: AgentDetails) => {
         const parts: string[] = [];
-        if (d.modelName) parts.push(d.modelName);
-        if (d.tags) parts.push(...d.tags);
+        if (d.modelName) parts.push(cleanUiText(d.modelName));
+        if (d.tags) parts.push(...d.tags.map(cleanUiText));
         if (d.turnCount != null && d.turnCount > 0) {
           parts.push(formatTurns(d.turnCount, d.maxTurns));
         }
         if (d.toolUses > 0) parts.push(`${d.toolUses} tool use${d.toolUses === 1 ? "" : "s"}`);
         if (d.tokens) parts.push(d.tokens);
-        return parts.map(p => fgPreservingNestedStyles(theme, "dim", p)).join(" " + theme.fg("dim", "·") + " ");
+        return parts.map(p => fgPreservingNestedStyles(theme, "dim", cleanUiText(p))).join(" " + theme.fg("dim", "·") + " ");
       };
 
       // ---- While running (streaming) ----
       if (isPartial || details.status === "running") {
         const frame = SPINNER[details.spinnerFrame ?? 0];
         const s = stats(details);
-        return renderRunningAgentStatus(frame, s, details.activity ?? "thinking…", theme);
+        return renderRunningAgentStatus(frame, s, cleanUiText(details.activity ?? "thinking…"), theme);
       }
 
       // ---- Background agent launched ----
       if (details.status === "background") {
-        return new Text(theme.fg("dim", `  ⎿  Running in background (ID: ${details.agentId})`), 0, 0);
+        return new Text(theme.fg("dim", `  ⎿  Running in background (ID: ${cleanUiText(details.agentId ?? "")})`), 0, 0);
       }
 
       // ---- Completed / Steered ----
@@ -978,7 +1020,8 @@ Terse command-style prompts produce shallow, generic work.
         line += " " + theme.fg("dim", "·") + " " + theme.fg("dim", duration);
 
         if (expanded) {
-          const resultText = result.content[0]?.type === "text" ? result.content[0].text : "";
+          const rawResult = result.content[0]?.type === "text" ? result.content[0].text : "";
+          const resultText = cleanUiLines(rawResult);
           if (resultText) {
             const lines = resultText.split("\n").slice(0, 50);
             for (const l of lines) {
@@ -1008,7 +1051,7 @@ Terse command-style prompts produce shallow, generic work.
       let line = theme.fg("error", "✗") + (s ? " " + s : "");
 
       if (details.status === "error") {
-        line += "\n" + theme.fg("error", `  ⎿  Error: ${details.error ?? "unknown"}`);
+        line += "\n" + theme.fg("error", `  ⎿  Error: ${cleanUiText(details.error ?? "unknown")}`);
       } else {
         line += "\n" + theme.fg("warning", "  ⎿  Aborted (max turns exceeded)");
       }
@@ -1025,82 +1068,33 @@ Terse command-style prompts produce shallow, generic work.
       // Reload custom agents so new project/global .md files are picked up without restart
       reloadCustomAgents();
 
-      const rawType = params.subagent_type as SubagentType;
-      const resolved = resolveType(rawType);
-      const subagentType = resolved ?? "general-purpose";
-      const fellBack = resolved === undefined;
+      const policy = resolveAgentInvocationPolicy({
+        selector: { kind: "registry", agentType: params.subagent_type as SubagentType },
+        params,
+        ctx,
+        scopeModels: isScopeModelsEnabled(),
+        defaultMaxTurns: getDefaultMaxTurns(),
+      });
+      if (!policy.ok) return textResult(policy.error);
+      if (policy.warning) ctx.ui.notify(cleanUiText(policy.warning), "warning");
 
+      const {
+        rawType,
+        subagentType,
+        fellBack,
+        fallbackUsesRegisteredGeneralPurpose,
+        resolvedConfig,
+        model,
+        modelName,
+        effectiveMaxTurns,
+        invocation: agentInvocation,
+      } = policy;
       const displayName = getDisplayName(subagentType);
-
-      // Get agent config (if any)
-      const customConfig = getAgentConfig(subagentType);
-
-      const resolvedConfig = resolveAgentInvocationConfig(customConfig, params);
-
-      // Resolve model from agent config first; tool-call params only fill gaps.
-      let model = ctx.model;
-      if (resolvedConfig.modelInput) {
-        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          if (resolvedConfig.modelFromParams) return textResult(resolved);
-          // config-specified: silent fallback to parent
-        } else {
-          model = resolved;
-        }
-      }
-
-      // Scope validation: the effective resolved model is checked against the
-      // user's enabledModels list (read in `enabled-models.ts`).
-      //
-      // Design: scopeModels guards against *runtime* LLM choices, not user-level config.
-      //   - Caller-supplied out-of-scope → hard error (the orchestrator made an explicit
-      //     out-of-scope choice; surface it so it picks differently).
-      //   - Frontmatter-pinned or parent-inherited out-of-scope → warn but proceed (the
-      //     user authored/installed this agent or chose the parent's model; trust it).
-      // See SubagentsSettings.scopeModels docstring for the full policy.
-      if (isScopeModelsEnabled() && model) {
-        const allowed = resolveEnabledModels(readEnabledModels(ctx.cwd), ctx.modelRegistry, ctx.cwd);
-        if (allowed && !isModelInScope(model, allowed)) {
-          if (resolvedConfig.modelFromParams) {
-            const list = [...allowed].sort().map(m => `  ${m}`).join("\n");
-            return textResult(
-              `Model not in scope: "${resolvedConfig.modelInput}".\n\n` +
-              `Allowed models (from enabledModels):\n${list}`,
-            );
-          }
-          // Frontmatter-pinned or parent-inherited: warn + proceed.
-          const agentLabel = customConfig?.displayName ?? subagentType;
-          const modelLabel = resolvedConfig.modelInput ?? `${model.provider}/${model.id}`;
-          ctx.ui.notify(
-            `Agent "${agentLabel}" using out-of-scope model "${modelLabel}"`,
-            "warning",
-          );
-        }
-      }
-
       const thinking = resolvedConfig.thinking;
       const inheritContext = resolvedConfig.inheritContext;
       const runInBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
       const isolation = resolvedConfig.isolation;
-
-      const parentModelId = ctx.model?.id;
-      const effectiveModelId = model?.id;
-      const modelName = effectiveModelId && effectiveModelId !== parentModelId
-        ? (model?.name ?? effectiveModelId).replace(/^Claude\s+/i, "").toLowerCase()
-        : undefined;
-      const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
-      const agentInvocation: AgentInvocation = {
-        modelName,
-        thinking,
-        // Explicit value only — the default fallback would just add noise.
-        // Normalize so `0` (unlimited) doesn't surface as a misleading "max turns: 0".
-        maxTurns: normalizeMaxTurns(resolvedConfig.maxTurns),
-        isolated,
-        inheritContext,
-        runInBackground,
-        isolation,
-      };
       // Tool-result render shows the mode label too; viewer's header already does.
       const modeLabel = getPromptModeLabel(subagentType);
       const { tags: invocationTags } = buildInvocationTags(agentInvocation);
@@ -1366,7 +1360,7 @@ Terse command-style prompts produce shallow, generic work.
       // "general-purpose" may itself be unregistered (defaults disabled, no
       // user override) — getConfig then uses the hardcoded fallback config.
       const fallbackNote = fellBack
-        ? `Note: Unknown agent type "${rawType}" — using ${resolveType("general-purpose") ? "general-purpose" : "the fallback agent config"}.\n\n`
+        ? `Note: Unknown agent type "${rawType}" — using ${fallbackUsesRegisteredGeneralPurpose ? "general-purpose" : "the fallback agent config"}.\n\n`
         : "";
 
       if (record.status === "error") {
@@ -1495,31 +1489,29 @@ Terse command-style prompts produce shallow, generic work.
       if (record.status !== "running") {
         return textResult(`Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`);
       }
-      if (!record.session) {
-        // Session not ready yet — queue the steer for delivery once initialized
-        if (!record.pendingSteers) record.pendingSteers = [];
-        record.pendingSteers.push(params.message);
-        pi.events.emit("subagents:steered", { id: record.id, message: params.message });
+      const sessionReady = record.session !== undefined;
+      try {
+        if (!await manager.steerAndWait(record.id, params.message)) {
+          return textResult(`Agent "${params.agent_id}" can no longer accept steering.`);
+        }
+      } catch (error) {
+        return textResult(`Failed to steer agent: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (!sessionReady) {
         return textResult(`Steering message queued for agent ${record.id}. It will be delivered once the session initializes.`);
       }
 
-      try {
-        await steerAgent(record.session, params.message);
-        pi.events.emit("subagents:steered", { id: record.id, message: params.message });
-        const tokens = formatLifetimeTokens(record);
-        const contextPercent = getSessionContextPercent(record.session);
-        const stateParts: string[] = [];
-        if (tokens) stateParts.push(tokens);
-        stateParts.push(`${record.toolUses} tool ${record.toolUses === 1 ? "use" : "uses"}`);
-        if (contextPercent !== null) stateParts.push(`context ${Math.round(contextPercent)}% full`);
-        if (record.compactionCount) stateParts.push(`${record.compactionCount} compaction${record.compactionCount === 1 ? "" : "s"}`);
-        return textResult(
-          `Steering message sent to agent ${record.id}. The agent will process it after its current tool execution.\n` +
-          `Current state: ${stateParts.join(" · ")}`,
-        );
-      } catch (err) {
-        return textResult(`Failed to steer agent: ${err instanceof Error ? err.message : String(err)}`);
-      }
+      const tokens = formatLifetimeTokens(record);
+      const contextPercent = getSessionContextPercent(record.session);
+      const stateParts: string[] = [];
+      if (tokens) stateParts.push(tokens);
+      stateParts.push(`${record.toolUses} tool ${record.toolUses === 1 ? "use" : "uses"}`);
+      if (contextPercent !== null) stateParts.push(`context ${Math.round(contextPercent)}% full`);
+      if (record.compactionCount) stateParts.push(`${record.compactionCount} compaction${record.compactionCount === 1 ? "" : "s"}`);
+      return textResult(
+        `Steering message sent to agent ${record.id}. The agent will process it after its current tool execution.\n` +
+        `Current state: ${stateParts.join(" · ")}`,
+      );
     },
   }));
 
@@ -1644,12 +1636,12 @@ Terse command-style prompts produce shallow, generic work.
       const model = getModelLabel(name, ctx.modelRegistry);
       return {
         id: name,
-        label: `${sourceIndicator(cfg)}${name}`,
-        currentValue: model,
-        description: disabled ? "(disabled)" : (cfg?.description ?? name),
+        label: `${sourceIndicator(cfg)}${cleanUiText(name)}`,
+        currentValue: cleanUiText(model),
+        description: disabled ? "(disabled)" : cleanUiText(cfg?.description ?? name),
         // Single-value list so Enter "activates" the row (fires onChange with the
         // agent's id) without offering anything to actually cycle.
-        values: [model],
+        values: [cleanUiText(model)],
       };
     });
 
@@ -1696,7 +1688,7 @@ Terse command-style prompts produce shallow, generic work.
     const options = agents.map(a => {
       const dn = getDisplayName(a.type);
       const dur = formatDuration(a.startedAt, a.completedAt);
-      return `${dn} (${a.description}) · ${a.toolUses} tools · ${a.status} · ${dur}`;
+      return `${dn} (${cleanUiText(a.description)}) · ${a.toolUses} tools · ${a.status} · ${dur}`;
     });
 
     const choice = await ctx.ui.select("Running agents", options);
@@ -1726,7 +1718,7 @@ Terse command-style prompts produce shallow, generic work.
       (tui, theme, keybindings, done) => {
         return new ConversationViewer(tui, session, record, activity, theme, done, () => {
           if (manager.abort(record.id)) {
-            ctx.ui.notify(`Stopped "${record.description}".`, "info");
+            ctx.ui.notify(`Stopped "${cleanUiText(record.description)}".`, "info");
           }
         }, keybindings, (message: string) => manager.steer(record.id, message));
       },
@@ -1740,7 +1732,7 @@ Terse command-style prompts produce shallow, generic work.
   async function showAgentDetail(ctx: ExtensionCommandContext, name: string) {
     const cfg = getAgentConfig(name);
     if (!cfg) {
-      ctx.ui.notify(`Agent config not found for "${name}".`, "warning");
+      ctx.ui.notify(`Agent config not found for "${cleanUiText(name)}".`, "warning");
       return;
     }
 
@@ -1765,33 +1757,33 @@ Terse command-style prompts produce shallow, generic work.
       menuOptions = ["Edit", "Disable", "Delete", "Back"];
     }
 
-    const choice = await ctx.ui.select(name, menuOptions);
+    const choice = await ctx.ui.select(cleanUiText(name), menuOptions);
     if (!choice || choice === "Back") return;
 
     if (choice === "Edit" && file) {
       const content = readFileSync(file.path, "utf-8");
-      const edited = await ctx.ui.editor(`Edit ${name}`, content);
+      const edited = await ctx.ui.editor(`Edit ${cleanUiText(name)}`, content);
       if (edited !== undefined && edited !== content) {
         const { writeFileSync } = await import("node:fs");
         writeFileSync(file.path, edited, "utf-8");
         reloadCustomAgents();
-        ctx.ui.notify(`Updated ${file.path}`, "info");
+        ctx.ui.notify(`Updated ${cleanUiText(file.path)}`, "info");
       }
     } else if (choice === "Delete") {
       if (file) {
-        const confirmed = await ctx.ui.confirm("Delete agent", `Delete ${name} from ${file.location} (${file.path})?`);
+        const confirmed = await ctx.ui.confirm("Delete agent", `Delete ${cleanUiText(name)} from ${file.location} (${cleanUiText(file.path)})?`);
         if (confirmed) {
           unlinkSync(file.path);
           reloadCustomAgents();
-          ctx.ui.notify(`Deleted ${file.path}`, "info");
+          ctx.ui.notify(`Deleted ${cleanUiText(file.path)}`, "info");
         }
       }
     } else if (choice === "Reset to default" && file) {
-      const confirmed = await ctx.ui.confirm("Reset to default", `Delete override ${file.path} and restore embedded default?`);
+      const confirmed = await ctx.ui.confirm("Reset to default", `Delete override ${cleanUiText(file.path)} and restore embedded default?`);
       if (confirmed) {
         unlinkSync(file.path);
         reloadCustomAgents();
-        ctx.ui.notify(`Restored default ${name}`, "info");
+        ctx.ui.notify(`Restored default ${cleanUiText(name)}`, "info");
       }
     } else if (choice.startsWith("Eject")) {
       await ejectAgent(ctx, name, cfg);
@@ -1806,7 +1798,7 @@ Terse command-style prompts produce shallow, generic work.
   async function ejectAgent(ctx: ExtensionCommandContext, name: string, cfg: AgentConfig) {
     const location = await ctx.ui.select("Choose location", [
       "Project (.pi/agents/)",
-      `Personal (${personalAgentsDir()})`,
+      `Personal (${cleanUiText(personalAgentsDir())})`,
     ]);
     if (!location) return;
 
@@ -1815,7 +1807,7 @@ Terse command-style prompts produce shallow, generic work.
 
     const targetPath = join(targetDir, `${name}.md`);
     if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
+      const overwrite = await ctx.ui.confirm("Overwrite", `${cleanUiText(targetPath)} already exists. Overwrite?`);
       if (!overwrite) return;
     }
 
@@ -1845,7 +1837,7 @@ Terse command-style prompts produce shallow, generic work.
     const { writeFileSync } = await import("node:fs");
     writeFileSync(targetPath, content, "utf-8");
     reloadCustomAgents();
-    ctx.ui.notify(`Ejected ${name} to ${targetPath}`, "info");
+    ctx.ui.notify(`Ejected ${cleanUiText(name)} to ${cleanUiText(targetPath)}`, "info");
   }
 
   /** Disable an agent: set enabled: false in its .md file, or create a stub for built-in defaults. */
@@ -1855,21 +1847,21 @@ Terse command-style prompts produce shallow, generic work.
       // Existing file — set enabled: false in frontmatter (idempotent)
       const content = readFileSync(file.path, "utf-8");
       if (content.includes("\nenabled: false\n")) {
-        ctx.ui.notify(`${name} is already disabled.`, "info");
+        ctx.ui.notify(`${cleanUiText(name)} is already disabled.`, "info");
         return;
       }
       const updated = content.replace(/^---\n/, "---\nenabled: false\n");
       const { writeFileSync } = await import("node:fs");
       writeFileSync(file.path, updated, "utf-8");
       reloadCustomAgents();
-      ctx.ui.notify(`Disabled ${name} (${file.path})`, "info");
+      ctx.ui.notify(`Disabled ${cleanUiText(name)} (${cleanUiText(file.path)})`, "info");
       return;
     }
 
     // No file (built-in default) — create a stub
     const location = await ctx.ui.select("Choose location", [
       "Project (.pi/agents/)",
-      `Personal (${personalAgentsDir()})`,
+      `Personal (${cleanUiText(personalAgentsDir())})`,
     ]);
     if (!location) return;
 
@@ -1880,7 +1872,7 @@ Terse command-style prompts produce shallow, generic work.
     const { writeFileSync } = await import("node:fs");
     writeFileSync(targetPath, "---\nenabled: false\n---\n", "utf-8");
     reloadCustomAgents();
-    ctx.ui.notify(`Disabled ${name} (${targetPath})`, "info");
+    ctx.ui.notify(`Disabled ${cleanUiText(name)} (${cleanUiText(targetPath)})`, "info");
   }
 
   /** Enable a disabled agent by removing enabled: false from its frontmatter. */
@@ -1896,18 +1888,18 @@ Terse command-style prompts produce shallow, generic work.
     if (updated.trim() === "---\n---" || updated.trim() === "---\n---\n") {
       unlinkSync(file.path);
       reloadCustomAgents();
-      ctx.ui.notify(`Enabled ${name} (removed ${file.path})`, "info");
+      ctx.ui.notify(`Enabled ${cleanUiText(name)} (removed ${cleanUiText(file.path)})`, "info");
     } else {
       writeFileSync(file.path, updated, "utf-8");
       reloadCustomAgents();
-      ctx.ui.notify(`Enabled ${name} (${file.path})`, "info");
+      ctx.ui.notify(`Enabled ${cleanUiText(name)} (${cleanUiText(file.path)})`, "info");
     }
   }
 
   async function showCreateWizard(ctx: ExtensionCommandContext) {
     const location = await ctx.ui.select("Choose location", [
       "Project (.pi/agents/)",
-      `Personal (${personalAgentsDir()})`,
+      `Personal (${cleanUiText(personalAgentsDir())})`,
     ]);
     if (!location) return;
 
@@ -1937,7 +1929,7 @@ Terse command-style prompts produce shallow, generic work.
 
     const targetPath = join(targetDir, `${name}.md`);
     if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
+      const overwrite = await ctx.ui.confirm("Overwrite", `${cleanUiText(targetPath)} already exists. Overwrite?`);
       if (!overwrite) return;
     }
 
@@ -1987,14 +1979,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
     });
 
     if (record.status === "error") {
-      ctx.ui.notify(`Generation failed: ${record.error}`, "warning");
+      ctx.ui.notify(`Generation failed: ${cleanUiText(record.error ?? "unknown")}`, "warning");
       return;
     }
 
     reloadCustomAgents();
 
     if (existsSync(targetPath)) {
-      ctx.ui.notify(`Created ${targetPath}`, "info");
+      ctx.ui.notify(`Created ${cleanUiText(targetPath)}`, "info");
     } else {
       ctx.ui.notify("Agent generation completed but file was not created. Check the agent output.", "warning");
     }
@@ -2071,14 +2063,14 @@ ${systemPrompt}
     const targetPath = join(targetDir, `${name}.md`);
 
     if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
+      const overwrite = await ctx.ui.confirm("Overwrite", `${cleanUiText(targetPath)} already exists. Overwrite?`);
       if (!overwrite) return;
     }
 
     const { writeFileSync } = await import("node:fs");
     writeFileSync(targetPath, content, "utf-8");
     reloadCustomAgents();
-    ctx.ui.notify(`Created ${targetPath}`, "info");
+    ctx.ui.notify(`Created ${cleanUiText(targetPath)}`, "info");
   }
 
   function snapshotSettings(): SubagentsSettings {

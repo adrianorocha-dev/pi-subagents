@@ -12,13 +12,14 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
-import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentConfig, AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
 export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void;
+export type OnAgentSteer = (record: AgentRecord, message: string) => void;
 export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; tokensBefore: number };
 
 /** Default max concurrent background agents. */
@@ -54,7 +55,7 @@ interface SpawnArgs {
   options: SpawnOptions;
 }
 
-interface SpawnOptions {
+export interface SpawnOptions {
   description: string;
   model?: Model<any>;
   maxTurns?: number;
@@ -68,6 +69,8 @@ interface SpawnOptions {
    * scheduler so a fired job can't be deferred past its trigger window.
    */
   bypassQueue?: boolean;
+  /** External controllers bypass both queue admission and running-background accounting. */
+  queuePolicy?: "external";
   /** Isolation mode — "worktree" creates a temp git worktree for the agent. */
   isolation?: IsolationMode;
   /**
@@ -81,6 +84,22 @@ interface SpawnOptions {
   cwd?: string;
   /** Resolved invocation snapshot captured for UI display. */
   invocation?: AgentInvocation;
+  /** Registry-independent embedded configuration selected by a controller. */
+  agentConfigOverride?: AgentConfig;
+  /** Operational extension denylist applied before child extension binding. */
+  controllerExtensionDenylist?: readonly string[];
+  /** Awaited after child extensions bind and before the first prompt. */
+  configureSession?: (session: AgentSession) => void | Promise<void>;
+  /** Called after the record enters the shared manager and before execution starts. */
+  onCreated?: (record: AgentRecord) => void;
+  /** Group identifier consumed by shared presentation surfaces. */
+  groupId?: string;
+  /** Suppress only the per-agent completion notification. */
+  suppressNotification?: boolean;
+  /** Suppress only the parent session's `subagents:record` entry. */
+  suppressParentRecord?: boolean;
+  /** Opaque data retained by reference and attached to lifecycle events. */
+  metadata?: Readonly<Record<string, unknown>>;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
   signal?: AbortSignal;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
@@ -103,6 +122,8 @@ export class AgentManager {
   private onComplete?: OnAgentComplete;
   private onStart?: OnAgentStart;
   private onCompact?: OnAgentCompact;
+  private onSteer?: OnAgentSteer;
+  private readonly recordRemovalListeners = new Set<(agentId: string) => void>();
   private maxConcurrent: number;
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
@@ -118,10 +139,12 @@ export class AgentManager {
     maxConcurrent = DEFAULT_MAX_CONCURRENT,
     onStart?: OnAgentStart,
     onCompact?: OnAgentCompact,
+    onSteer?: OnAgentSteer,
   ) {
     this.onComplete = onComplete;
     this.onStart = onStart;
     this.onCompact = onCompact;
+    this.onSteer = onSteer;
     this.maxConcurrent = maxConcurrent;
     // Cleanup completed agents after 10 minutes (but keep sessions for resume)
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
@@ -161,7 +184,7 @@ export class AgentManager {
       id,
       type,
       description: options.description,
-      status: options.isBackground ? "queued" : "running",
+      status: options.isBackground && options.queuePolicy !== "external" ? "queued" : "running",
       toolUses: 0,
       startedAt: Date.now(),
       abortController,
@@ -174,12 +197,28 @@ export class AgentManager {
       // have no inline surface — stay visible instead of vanishing.
       isBackground: options.isBackground,
       invocation: options.invocation,
+      groupId: options.groupId,
+      queuePolicy: options.queuePolicy,
+      suppressNotification: options.suppressNotification,
+      suppressParentRecord: options.suppressParentRecord,
+      metadata: options.metadata,
     };
     this.agents.set(id, record);
+    try {
+      options.onCreated?.(record);
+    } catch (error) {
+      this.agents.delete(id);
+      throw error;
+    }
 
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
 
-    if (options.isBackground && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
+    if (
+      options.isBackground &&
+      options.queuePolicy !== "external" &&
+      !options.bypassQueue &&
+      this.runningBackground >= this.maxConcurrent
+    ) {
       // Queue it — will be started when a running agent completes
       this.queue.push({ id, args });
       return id;
@@ -232,7 +271,7 @@ export class AgentManager {
 
     record.status = "running";
     record.startedAt = Date.now();
-    if (options.isBackground) this.runningBackground++;
+    if (options.isBackground && options.queuePolicy !== "external") this.runningBackground++;
     this.onStart?.(record);
 
     // Wire parent abort signal to stop the subagent when the parent is interrupted
@@ -252,6 +291,9 @@ export class AgentManager {
       isolated: options.isolated,
       inheritContext: options.inheritContext,
       thinkingLevel: options.thinkingLevel,
+      agentConfigOverride: options.agentConfigOverride,
+      controllerExtensionDenylist: options.controllerExtensionDenylist,
+      configureSession: options.configureSession,
       // Worktree wins for the working dir (the agent must run in the copy —
       // which, with a custom cwd, was created from that target). Config stays
       // with the parent project when a caller-supplied cwd is in play; it must
@@ -333,9 +375,9 @@ export class AgentManager {
           record.resultConsumed = true;
           try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
         } else {
-          this.runningBackground--;
+          if (options.queuePolicy !== "external") this.runningBackground--;
           try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-          this.drainQueue();
+          if (options.queuePolicy !== "external") this.drainQueue();
         }
         return responseText;
       })
@@ -369,9 +411,9 @@ export class AgentManager {
           record.resultConsumed = true;
           this.onComplete?.(record);
         } else {
-          this.runningBackground--;
+          if (options.queuePolicy !== "external") this.runningBackground--;
           this.onComplete?.(record);
-          this.drainQueue();
+          if (options.queuePolicy !== "external") this.drainQueue();
         }
         return "";
       });
@@ -498,16 +540,46 @@ export class AgentManager {
     if (!record) return false;
     if (record.status !== "running" && record.status !== "queued") return false;
     if (record.session) {
-      record.session.steer(message).catch(() => {});
+      void record.session.steer(message).then(
+        () => this.onSteer?.(record, message),
+        () => undefined,
+      );
+    } else {
+      if (!record.pendingSteers) record.pendingSteers = [];
+      record.pendingSteers.push(message);
+      this.onSteer?.(record, message);
+    }
+    return true;
+  }
+
+  /** Awaited steering variant used by the Agent tool so delivery errors remain visible. */
+  async steerAndWait(id: string, message: string): Promise<boolean> {
+    const record = this.agents.get(id);
+    if (!record) return false;
+    if (record.status !== "running" && record.status !== "queued") return false;
+    if (record.session) {
+      await record.session.steer(message);
     } else {
       if (!record.pendingSteers) record.pendingSteers = [];
       record.pendingSteers.push(message);
     }
+    this.onSteer?.(record, message);
     return true;
   }
 
   getRecord(id: string): AgentRecord | undefined {
     return this.agents.get(id);
+  }
+
+  /** Observe record eviction without coupling consumers to the cleanup timer. */
+  onRecordRemoved(listener: (agentId: string) => void): () => void {
+    this.recordRemovalListeners.add(listener);
+    let subscribed = true;
+    return () => {
+      if (!subscribed) return;
+      subscribed = false;
+      this.recordRemovalListeners.delete(listener);
+    };
   }
 
   listAgents(): AgentRecord[] {
@@ -540,6 +612,9 @@ export class AgentManager {
     record.session?.dispose?.();
     record.session = undefined;
     this.agents.delete(id);
+    for (const listener of this.recordRemovalListeners) {
+      try { listener(id); } catch { /* ignore record-removal observer errors */ }
+    }
   }
 
   private cleanup() {
@@ -616,10 +691,8 @@ export class AgentManager {
     clearInterval(this.cleanupInterval);
     // Clear queue
     this.queue = [];
-    for (const record of this.agents.values()) {
-      record.session?.dispose();
-    }
-    this.agents.clear();
+    for (const [id, record] of this.agents) this.removeRecord(id, record);
+    this.recordRemovalListeners.clear();
     // Prune any orphaned git worktrees (crash recovery)
     try { pruneWorktrees(process.cwd()); } catch { /* ignore */ }
     // Also prune repos that caller-supplied cwds created worktrees in — a clean

@@ -29,6 +29,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
 - **Cross-extension RPC** — other pi extensions can spawn and stop subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start
+- **Versioned same-process host** — controllers that need pre-prompt child configuration can discover `SubagentHostV1` at `Symbol.for("pi-subagents:host")`, while retaining the normal Agent policy, manager, FleetView, worktrees, transcripts, usage, and lifecycle events
 - **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same `subagent-notification` followUp path as manual background completions; manage via `/agents → Scheduled jobs`
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
 
@@ -450,6 +451,48 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 
 `tokens.total` = `input + output + cacheWrite`. `cacheRead` is excluded — each turn's `cacheRead` is the cumulative cached prefix re-read on that one API call, so summing per-message would over-count it. Use `contextUsage.percent` (surfaced as `(NN%)` in the widget) for current context size.
 
+Managed-host agents add their opaque `metadata` object unchanged to `created`, `started`, `steered`, `compacted`, and terminal (`completed`/`failed`) lifecycle payloads.
+
+## Same-Process SubagentHostV1
+
+Controllers that need more than the event RPC can discover the root-owned host after `subagents:ready`:
+
+```typescript
+const candidate = Reflect.get(globalThis, Symbol.for("pi-subagents:host"));
+if (!candidate || candidate.version !== 1) throw new Error("SubagentHostV1 unavailable");
+
+const managed = candidate.spawn({
+  prompt: "Review the change and return a concise result.",
+  description: "workflow review",
+  agentType: "reviewer",
+  queue: "external",
+  notification: "suppress",
+  metadata: { workflowRunId: "run-1", callKey: "review-1" },
+  excludeExtensions: ["pi-workflows"],
+  transcriptDirectory: "/existing/run/transcripts",
+}, {
+  configureSession(session) {
+    session.agent.state.systemPrompt += "\nReturn only the workflow result.";
+  },
+});
+
+const result = await managed.completion;
+```
+
+Version 1 guarantees:
+
+- explicit types use the same case-insensitive lookup, frontmatter precedence, fuzzy model resolution, model-scope policy, thinking, max-turn, and worktree validation as `Agent`;
+- `{ baseConfig: { source: "embedded", name: "general-purpose" } }` selects the embedded default even when defaults are disabled or a project overrides that name;
+- `queue: "external"` bypasses the internal background queue and does not consume its concurrency slots;
+- `configureSession` is awaited after child extensions bind and before the first prompt; the supported surface includes mutable `session.agent.state.tools`, `state.systemPrompt`, `streamFn`, and `beforeToolCall`, awaited `agent.subscribe(...)` listeners, plus `prompt`, `steer`, `abort`, and `waitForIdle`;
+- `excludeExtensions` is an operational denylist applied before child binding and wins over custom-agent inclusion;
+- managed records stay in the shared manager, widget, and FleetView; `registerGroupProvider()` adds neutral nested group views to the shared `agents` widget, with terminal controls removed from external labels and agent presentation text;
+- `notification: "suppress"` suppresses both the follow-up and parent `subagents:record` bookkeeping;
+- `transcriptDirectory` must already exist and receives `<agentId>.jsonl`;
+- completion resolves to normalized terminal status, text, lifetime usage, and worktree data only after the shared manager promise (including terminal events and cleanup) and all queued managed hooks settle. `stop(id)` synchronously reports whether cancellation was accepted but does not release completion; accepted cancellation normalizes the eventual status to `stopped`, and `waitForAll()` observes the same settlement boundary. `stop`, `get`, and `waitForAll` remain idempotent.
+
+The first activation whose root `session_start` actually binds owns the global symbol. Factory-only and later child activations publish no host, RPC handlers, or ready event; they cannot replace or release the owner. Root shutdown removes only its exact host instance. The exported TypeScript declarations are optional convenience; runtime discovery remains structural and does not require importing this package.
+
 ## Cross-Extension RPC
 
 Other pi extensions can spawn and stop subagents programmatically via the `pi.events` event bus, without importing this package directly.
@@ -612,6 +655,8 @@ src/
   agent-types.ts      # Unified agent registry (defaults + user), tool name resolution
   agent-runner.ts     # Session creation, execution, graceful max_turns, steer/resume
   agent-manager.ts    # Agent lifecycle, concurrency queue, completion notifications
+  invocation-policy.ts # Shared Agent/host type, frontmatter, model, and scope policy
+  subagent-host.ts    # Root-owned Symbol.for("pi-subagents:host") V1 implementation
   cross-extension-rpc.ts # RPC handlers for cross-extension spawn/ping via pi.events
   group-join.ts       # Group join manager: batched completion notifications with timeout
   custom-agents.ts    # Load user-defined agents from .pi/agents/, .agents/agents/, and global agents
