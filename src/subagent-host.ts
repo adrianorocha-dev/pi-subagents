@@ -20,6 +20,7 @@ import type {
   SubagentHostV1,
 } from "./types.js";
 import type { AgentActivity } from "./ui/agent-widget.js";
+import { cleanUiText } from "./ui/terminal-controls.js";
 
 export const SUBAGENT_HOST_SYMBOL = Symbol.for("pi-subagents:host");
 export const SUBAGENT_HOST_VERSION = 1 as const;
@@ -149,7 +150,7 @@ export class ManagedSubagentHost implements SubagentHostV1 {
       defaultMaxTurns: this.dependencies.defaultMaxTurns(),
     });
     if (!policy.ok) throw new Error(policy.error);
-    if (policy.warning) ctx.ui.notify(policy.warning, "warning");
+    if (policy.warning) ctx.ui.notify(cleanUiText(policy.warning), "warning");
 
     const hostState: HostAgentState = { turnCount: 0 };
     const { state: activityState, callbacks: activityCallbacks } = createActivityTracker(policy.effectiveMaxTurns);

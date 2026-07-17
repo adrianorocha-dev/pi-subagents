@@ -305,13 +305,14 @@ describe("FleetList rendering", () => {
     expect(agentLine).toMatch(/\d+s · ↓/); // "<seconds>s · ↓ ..." (timing-agnostic)
   });
 
-  it("neutralizes OSC, CSI, and C1 controls in agent descriptions", () => {
+  it("neutralizes OSC 52, CSI, and C1 controls in agent descriptions", () => {
     const description =
-      "safe\u001b[2J row\u001b]8;;https://evil.example\u0007 label\u001b]8;;\u0007\u009b31m\u009d2;owned\u009c";
+      "safe\u001b[2J row\u001b]52;c;ZmxlZXQtY2xpcGJvYXJkLXNlY3JldA==\u0007\u001b]8;;https://evil.example\u0007 label\u001b]8;;\u0007\u009b31m\u009d2;owned\u009c";
     const rendered = harness([makeRecord({ description })]).render(160).join("\n");
 
     expect(rendered).toContain("safe row label");
     expect(rendered).not.toContain("evil.example");
+    expect(rendered).not.toContain("ZmxlZXQtY2xpcGJvYXJkLXNlY3JldA==");
     expect(rendered).not.toContain("owned");
     expect(rendered).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/u);
   });

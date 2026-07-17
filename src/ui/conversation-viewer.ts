@@ -12,7 +12,7 @@ import type { AgentRecord } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
 import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatDuration, formatSessionTokens, getDisplayName, getPromptModeLabel } from "./agent-widget.js";
-import { cleanUiText } from "./terminal-controls.js";
+import { cleanUiLines, cleanUiText } from "./terminal-controls.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
 /** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
@@ -296,13 +296,13 @@ export class ConversationViewer implements Component {
     let needsSeparator = false;
     for (const msg of messages) {
       if (msg.role === "user") {
-        const text = typeof msg.content === "string"
+        const text = cleanUiLines(typeof msg.content === "string"
           ? msg.content
-          : extractText(msg.content);
-        if (!text.trim()) continue;
+          : extractText(msg.content)).trim();
+        if (!text) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("accent", "[User]"));
-        for (const line of wrapTextWithAnsi(text.trim(), width)) {
+        for (const line of wrapTextWithAnsi(text, width)) {
           lines.push(line);
         }
       } else if (msg.role === "assistant") {
@@ -311,13 +311,14 @@ export class ConversationViewer implements Component {
         for (const c of msg.content) {
           if (c.type === "text" && c.text) textParts.push(c.text);
           else if (c.type === "toolCall") {
-            toolCalls.push((c as any).name ?? (c as any).toolName ?? "unknown");
+            toolCalls.push(cleanUiText(String((c as any).name ?? (c as any).toolName ?? "unknown")));
           }
         }
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.bold("[Assistant]"));
         if (textParts.length > 0) {
-          for (const line of wrapTextWithAnsi(textParts.join("\n").trim(), width)) {
+          const text = cleanUiLines(textParts.join("\n")).trim();
+          for (const line of wrapTextWithAnsi(text, width)) {
             lines.push(line);
           }
         }
@@ -325,23 +326,25 @@ export class ConversationViewer implements Component {
           lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
         }
       } else if (msg.role === "toolResult") {
-        const text = extractText(msg.content);
+        const text = cleanUiLines(extractText(msg.content)).trim();
         const truncated = text.length > 500 ? text.slice(0, 500) + "... (truncated)" : text;
-        if (!truncated.trim()) continue;
+        if (!truncated) continue;
         if (needsSeparator) lines.push(th.fg("dim", "───"));
         lines.push(th.fg("dim", "[Result]"));
-        for (const line of wrapTextWithAnsi(truncated.trim(), width)) {
+        for (const line of wrapTextWithAnsi(truncated, width)) {
           lines.push(th.fg("dim", line));
         }
       } else if ((msg as any).role === "bashExecution") {
         const bash = msg as any;
+        const command = cleanUiText(String(bash.command ?? ""));
         if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(truncateToWidth(th.fg("muted", `  $ ${bash.command}`), width));
-        if (bash.output?.trim()) {
-          const out = bash.output.length > 500
-            ? bash.output.slice(0, 500) + "... (truncated)"
-            : bash.output;
-          for (const line of wrapTextWithAnsi(out.trim(), width)) {
+        lines.push(truncateToWidth(th.fg("muted", `  $ ${command}`), width));
+        const output = typeof bash.output === "string" ? cleanUiLines(bash.output).trim() : "";
+        if (output) {
+          const out = output.length > 500
+            ? output.slice(0, 500) + "... (truncated)"
+            : output;
+          for (const line of wrapTextWithAnsi(out, width)) {
             lines.push(th.fg("dim", line));
           }
         }

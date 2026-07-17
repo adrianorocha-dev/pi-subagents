@@ -22,8 +22,19 @@ function consumeStringControl(value: string, start: number, bellTerminates: bool
   return value.length - 1;
 }
 
+export interface TerminalControlOptions {
+  /** Keep LF line breaks for multi-line TUI content. Other C0 controls remain neutralized. */
+  preserveNewlines?: boolean;
+  /** Replacement for standalone controls. Escape sequences are always removed completely. */
+  replacement?: string;
+}
+
 /** Remove terminal escape sequences and replace standalone C0/C1 controls. */
-export function neutralizeTerminalControls(value: string, replacement = " "): string {
+export function neutralizeTerminalControls(
+  value: string,
+  options: TerminalControlOptions = {},
+): string {
+  const replacement = options.replacement ?? " ";
   let result = "";
   for (let index = 0; index < value.length; index++) {
     const code = value.charCodeAt(index);
@@ -67,12 +78,20 @@ export function neutralizeTerminalControls(value: string, replacement = " "): st
       continue;
     }
     if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
-      result += replacement;
+      if (options.preserveNewlines && code === 0x0a) result += "\n";
+      else if (!(options.preserveNewlines && code === 0x0d && value.charCodeAt(index + 1) === 0x0a)) {
+        result += replacement;
+      }
       continue;
     }
     result += value[index] ?? "";
   }
   return result;
+}
+
+/** Preserve line feeds in untrusted multi-line content before wrapping or applying theme ANSI. */
+export function cleanUiLines(value: string): string {
+  return neutralizeTerminalControls(value, { preserveNewlines: true });
 }
 
 /** Normalize untrusted labels to one printable line before applying theme ANSI. */

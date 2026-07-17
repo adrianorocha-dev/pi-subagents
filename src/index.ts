@@ -51,6 +51,7 @@ import {
 } from "./ui/agent-widget.js";
 import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
+import { cleanUiLines, cleanUiText } from "./ui/terminal-controls.js";
 import { getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
 
 export { SUBAGENT_HOST_SYMBOL, SUBAGENT_HOST_VERSION } from "./subagent-host.js";
@@ -198,22 +199,23 @@ function buildDetails(
 function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, activity?: AgentActivity): NotificationDetails {
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
 
+  const safeResult = record.result ? cleanUiLines(record.result) : "No output.";
+  const resultPreview = safeResult.length > resultMaxLen
+    ? safeResult.slice(0, resultMaxLen) + "…"
+    : safeResult;
+
   return {
-    id: record.id,
-    description: record.description,
-    status: record.status,
+    id: cleanUiText(record.id),
+    description: cleanUiText(record.description),
+    status: cleanUiText(record.status),
     toolUses: record.toolUses,
     turnCount: activity?.turnCount ?? 0,
     maxTurns: activity?.maxTurns,
     totalTokens,
     durationMs: record.completedAt ? record.completedAt - record.startedAt : 0,
-    outputFile: record.outputFile,
-    error: record.error,
-    resultPreview: record.result
-      ? record.result.length > resultMaxLen
-        ? record.result.slice(0, resultMaxLen) + "…"
-        : record.result
-      : "No output.",
+    outputFile: record.outputFile ? cleanUiText(record.outputFile) : undefined,
+    error: record.error ? cleanUiText(record.error) : undefined,
+    resultPreview: cleanUiLines(resultPreview),
   };
 }
 
@@ -226,14 +228,16 @@ export default function (pi: ExtensionAPI) {
       if (!d) return undefined;
 
       function renderOne(d: NotificationDetails): string {
-        const isError = d.status === "error" || d.status === "stopped" || d.status === "aborted";
+        const status = cleanUiText(d.status);
+        const description = cleanUiText(d.description);
+        const isError = status === "error" || status === "stopped" || status === "aborted";
         const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-        const statusText = isError ? d.status
-          : d.status === "steered" ? "completed (steered)"
+        const statusText = isError ? status
+          : status === "steered" ? "completed (steered)"
           : "completed";
 
         // Line 1: icon + agent description + status
-        let line = `${icon} ${theme.bold(d.description)} ${theme.fg("dim", statusText)}`;
+        let line = `${icon} ${theme.bold(description)} ${theme.fg("dim", statusText)}`;
 
         // Line 2: stats
         const parts: string[] = [];
@@ -246,17 +250,18 @@ export default function (pi: ExtensionAPI) {
         }
 
         // Line 3: result preview (collapsed) or full (expanded)
+        const resultPreview = cleanUiLines(d.resultPreview);
         if (expanded) {
-          const lines = d.resultPreview.split("\n").slice(0, 30);
+          const lines = resultPreview.split("\n").slice(0, 30);
           for (const l of lines) line += "\n" + theme.fg("dim", `  ${l}`);
         } else {
-          const preview = d.resultPreview.split("\n")[0]?.slice(0, 80) ?? "";
+          const preview = resultPreview.split("\n")[0]?.slice(0, 80) ?? "";
           line += "\n  " + theme.fg("dim", `⎿  ${preview}`);
         }
 
         // Line 4: output file link (if present)
         if (d.outputFile) {
-          line += "\n  " + theme.fg("muted", `transcript: ${d.outputFile}`);
+          line += "\n  " + theme.fg("muted", `transcript: ${cleanUiText(d.outputFile)}`);
         }
 
         return line;
@@ -969,40 +974,40 @@ Terse command-style prompts produce shallow, generic work.
 
     renderCall(args, theme) {
       const displayName = args.subagent_type ? getDisplayName(args.subagent_type) : "Agent";
-      const desc = args.description ?? "";
-      return new Text("▸ " + theme.fg("toolTitle", theme.bold(displayName)) + (desc ? "  " + theme.fg("muted", desc) : ""), 0, 0);
+      const description = cleanUiText(args.description ?? "");
+      return new Text("▸ " + theme.fg("toolTitle", theme.bold(displayName)) + (description ? "  " + theme.fg("muted", description) : ""), 0, 0);
     },
 
     renderResult(result, { expanded, isPartial }, theme) {
       const details = result.details as AgentDetails | undefined;
       if (!details) {
         const text = result.content[0]?.type === "text" ? result.content[0].text : "";
-        return new Text(text, 0, 0);
+        return new Text(cleanUiLines(text), 0, 0);
       }
 
       // Helper: build "haiku · thinking: high · ↻5≤30 · 3 tool uses · 33.8k tokens" stats string
       const stats = (d: AgentDetails) => {
         const parts: string[] = [];
-        if (d.modelName) parts.push(d.modelName);
-        if (d.tags) parts.push(...d.tags);
+        if (d.modelName) parts.push(cleanUiText(d.modelName));
+        if (d.tags) parts.push(...d.tags.map(cleanUiText));
         if (d.turnCount != null && d.turnCount > 0) {
           parts.push(formatTurns(d.turnCount, d.maxTurns));
         }
         if (d.toolUses > 0) parts.push(`${d.toolUses} tool use${d.toolUses === 1 ? "" : "s"}`);
         if (d.tokens) parts.push(d.tokens);
-        return parts.map(p => fgPreservingNestedStyles(theme, "dim", p)).join(" " + theme.fg("dim", "·") + " ");
+        return parts.map(p => fgPreservingNestedStyles(theme, "dim", cleanUiText(p))).join(" " + theme.fg("dim", "·") + " ");
       };
 
       // ---- While running (streaming) ----
       if (isPartial || details.status === "running") {
         const frame = SPINNER[details.spinnerFrame ?? 0];
         const s = stats(details);
-        return renderRunningAgentStatus(frame, s, details.activity ?? "thinking…", theme);
+        return renderRunningAgentStatus(frame, s, cleanUiText(details.activity ?? "thinking…"), theme);
       }
 
       // ---- Background agent launched ----
       if (details.status === "background") {
-        return new Text(theme.fg("dim", `  ⎿  Running in background (ID: ${details.agentId})`), 0, 0);
+        return new Text(theme.fg("dim", `  ⎿  Running in background (ID: ${cleanUiText(details.agentId ?? "")})`), 0, 0);
       }
 
       // ---- Completed / Steered ----
@@ -1015,7 +1020,8 @@ Terse command-style prompts produce shallow, generic work.
         line += " " + theme.fg("dim", "·") + " " + theme.fg("dim", duration);
 
         if (expanded) {
-          const resultText = result.content[0]?.type === "text" ? result.content[0].text : "";
+          const rawResult = result.content[0]?.type === "text" ? result.content[0].text : "";
+          const resultText = cleanUiLines(rawResult);
           if (resultText) {
             const lines = resultText.split("\n").slice(0, 50);
             for (const l of lines) {
@@ -1045,7 +1051,7 @@ Terse command-style prompts produce shallow, generic work.
       let line = theme.fg("error", "✗") + (s ? " " + s : "");
 
       if (details.status === "error") {
-        line += "\n" + theme.fg("error", `  ⎿  Error: ${details.error ?? "unknown"}`);
+        line += "\n" + theme.fg("error", `  ⎿  Error: ${cleanUiText(details.error ?? "unknown")}`);
       } else {
         line += "\n" + theme.fg("warning", "  ⎿  Aborted (max turns exceeded)");
       }
@@ -1070,7 +1076,7 @@ Terse command-style prompts produce shallow, generic work.
         defaultMaxTurns: getDefaultMaxTurns(),
       });
       if (!policy.ok) return textResult(policy.error);
-      if (policy.warning) ctx.ui.notify(policy.warning, "warning");
+      if (policy.warning) ctx.ui.notify(cleanUiText(policy.warning), "warning");
 
       const {
         rawType,
@@ -1630,12 +1636,12 @@ Terse command-style prompts produce shallow, generic work.
       const model = getModelLabel(name, ctx.modelRegistry);
       return {
         id: name,
-        label: `${sourceIndicator(cfg)}${name}`,
-        currentValue: model,
-        description: disabled ? "(disabled)" : (cfg?.description ?? name),
+        label: `${sourceIndicator(cfg)}${cleanUiText(name)}`,
+        currentValue: cleanUiText(model),
+        description: disabled ? "(disabled)" : cleanUiText(cfg?.description ?? name),
         // Single-value list so Enter "activates" the row (fires onChange with the
         // agent's id) without offering anything to actually cycle.
-        values: [model],
+        values: [cleanUiText(model)],
       };
     });
 
@@ -1682,7 +1688,7 @@ Terse command-style prompts produce shallow, generic work.
     const options = agents.map(a => {
       const dn = getDisplayName(a.type);
       const dur = formatDuration(a.startedAt, a.completedAt);
-      return `${dn} (${a.description}) · ${a.toolUses} tools · ${a.status} · ${dur}`;
+      return `${dn} (${cleanUiText(a.description)}) · ${a.toolUses} tools · ${a.status} · ${dur}`;
     });
 
     const choice = await ctx.ui.select("Running agents", options);
@@ -1712,7 +1718,7 @@ Terse command-style prompts produce shallow, generic work.
       (tui, theme, keybindings, done) => {
         return new ConversationViewer(tui, session, record, activity, theme, done, () => {
           if (manager.abort(record.id)) {
-            ctx.ui.notify(`Stopped "${record.description}".`, "info");
+            ctx.ui.notify(`Stopped "${cleanUiText(record.description)}".`, "info");
           }
         }, keybindings, (message: string) => manager.steer(record.id, message));
       },
@@ -1726,7 +1732,7 @@ Terse command-style prompts produce shallow, generic work.
   async function showAgentDetail(ctx: ExtensionCommandContext, name: string) {
     const cfg = getAgentConfig(name);
     if (!cfg) {
-      ctx.ui.notify(`Agent config not found for "${name}".`, "warning");
+      ctx.ui.notify(`Agent config not found for "${cleanUiText(name)}".`, "warning");
       return;
     }
 
@@ -1751,33 +1757,33 @@ Terse command-style prompts produce shallow, generic work.
       menuOptions = ["Edit", "Disable", "Delete", "Back"];
     }
 
-    const choice = await ctx.ui.select(name, menuOptions);
+    const choice = await ctx.ui.select(cleanUiText(name), menuOptions);
     if (!choice || choice === "Back") return;
 
     if (choice === "Edit" && file) {
       const content = readFileSync(file.path, "utf-8");
-      const edited = await ctx.ui.editor(`Edit ${name}`, content);
+      const edited = await ctx.ui.editor(`Edit ${cleanUiText(name)}`, content);
       if (edited !== undefined && edited !== content) {
         const { writeFileSync } = await import("node:fs");
         writeFileSync(file.path, edited, "utf-8");
         reloadCustomAgents();
-        ctx.ui.notify(`Updated ${file.path}`, "info");
+        ctx.ui.notify(`Updated ${cleanUiText(file.path)}`, "info");
       }
     } else if (choice === "Delete") {
       if (file) {
-        const confirmed = await ctx.ui.confirm("Delete agent", `Delete ${name} from ${file.location} (${file.path})?`);
+        const confirmed = await ctx.ui.confirm("Delete agent", `Delete ${cleanUiText(name)} from ${file.location} (${cleanUiText(file.path)})?`);
         if (confirmed) {
           unlinkSync(file.path);
           reloadCustomAgents();
-          ctx.ui.notify(`Deleted ${file.path}`, "info");
+          ctx.ui.notify(`Deleted ${cleanUiText(file.path)}`, "info");
         }
       }
     } else if (choice === "Reset to default" && file) {
-      const confirmed = await ctx.ui.confirm("Reset to default", `Delete override ${file.path} and restore embedded default?`);
+      const confirmed = await ctx.ui.confirm("Reset to default", `Delete override ${cleanUiText(file.path)} and restore embedded default?`);
       if (confirmed) {
         unlinkSync(file.path);
         reloadCustomAgents();
-        ctx.ui.notify(`Restored default ${name}`, "info");
+        ctx.ui.notify(`Restored default ${cleanUiText(name)}`, "info");
       }
     } else if (choice.startsWith("Eject")) {
       await ejectAgent(ctx, name, cfg);
@@ -1792,7 +1798,7 @@ Terse command-style prompts produce shallow, generic work.
   async function ejectAgent(ctx: ExtensionCommandContext, name: string, cfg: AgentConfig) {
     const location = await ctx.ui.select("Choose location", [
       "Project (.pi/agents/)",
-      `Personal (${personalAgentsDir()})`,
+      `Personal (${cleanUiText(personalAgentsDir())})`,
     ]);
     if (!location) return;
 
@@ -1801,7 +1807,7 @@ Terse command-style prompts produce shallow, generic work.
 
     const targetPath = join(targetDir, `${name}.md`);
     if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
+      const overwrite = await ctx.ui.confirm("Overwrite", `${cleanUiText(targetPath)} already exists. Overwrite?`);
       if (!overwrite) return;
     }
 
@@ -1831,7 +1837,7 @@ Terse command-style prompts produce shallow, generic work.
     const { writeFileSync } = await import("node:fs");
     writeFileSync(targetPath, content, "utf-8");
     reloadCustomAgents();
-    ctx.ui.notify(`Ejected ${name} to ${targetPath}`, "info");
+    ctx.ui.notify(`Ejected ${cleanUiText(name)} to ${cleanUiText(targetPath)}`, "info");
   }
 
   /** Disable an agent: set enabled: false in its .md file, or create a stub for built-in defaults. */
@@ -1841,21 +1847,21 @@ Terse command-style prompts produce shallow, generic work.
       // Existing file — set enabled: false in frontmatter (idempotent)
       const content = readFileSync(file.path, "utf-8");
       if (content.includes("\nenabled: false\n")) {
-        ctx.ui.notify(`${name} is already disabled.`, "info");
+        ctx.ui.notify(`${cleanUiText(name)} is already disabled.`, "info");
         return;
       }
       const updated = content.replace(/^---\n/, "---\nenabled: false\n");
       const { writeFileSync } = await import("node:fs");
       writeFileSync(file.path, updated, "utf-8");
       reloadCustomAgents();
-      ctx.ui.notify(`Disabled ${name} (${file.path})`, "info");
+      ctx.ui.notify(`Disabled ${cleanUiText(name)} (${cleanUiText(file.path)})`, "info");
       return;
     }
 
     // No file (built-in default) — create a stub
     const location = await ctx.ui.select("Choose location", [
       "Project (.pi/agents/)",
-      `Personal (${personalAgentsDir()})`,
+      `Personal (${cleanUiText(personalAgentsDir())})`,
     ]);
     if (!location) return;
 
@@ -1866,7 +1872,7 @@ Terse command-style prompts produce shallow, generic work.
     const { writeFileSync } = await import("node:fs");
     writeFileSync(targetPath, "---\nenabled: false\n---\n", "utf-8");
     reloadCustomAgents();
-    ctx.ui.notify(`Disabled ${name} (${targetPath})`, "info");
+    ctx.ui.notify(`Disabled ${cleanUiText(name)} (${cleanUiText(targetPath)})`, "info");
   }
 
   /** Enable a disabled agent by removing enabled: false from its frontmatter. */
@@ -1882,18 +1888,18 @@ Terse command-style prompts produce shallow, generic work.
     if (updated.trim() === "---\n---" || updated.trim() === "---\n---\n") {
       unlinkSync(file.path);
       reloadCustomAgents();
-      ctx.ui.notify(`Enabled ${name} (removed ${file.path})`, "info");
+      ctx.ui.notify(`Enabled ${cleanUiText(name)} (removed ${cleanUiText(file.path)})`, "info");
     } else {
       writeFileSync(file.path, updated, "utf-8");
       reloadCustomAgents();
-      ctx.ui.notify(`Enabled ${name} (${file.path})`, "info");
+      ctx.ui.notify(`Enabled ${cleanUiText(name)} (${cleanUiText(file.path)})`, "info");
     }
   }
 
   async function showCreateWizard(ctx: ExtensionCommandContext) {
     const location = await ctx.ui.select("Choose location", [
       "Project (.pi/agents/)",
-      `Personal (${personalAgentsDir()})`,
+      `Personal (${cleanUiText(personalAgentsDir())})`,
     ]);
     if (!location) return;
 
@@ -1923,7 +1929,7 @@ Terse command-style prompts produce shallow, generic work.
 
     const targetPath = join(targetDir, `${name}.md`);
     if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
+      const overwrite = await ctx.ui.confirm("Overwrite", `${cleanUiText(targetPath)} already exists. Overwrite?`);
       if (!overwrite) return;
     }
 
@@ -1973,14 +1979,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
     });
 
     if (record.status === "error") {
-      ctx.ui.notify(`Generation failed: ${record.error}`, "warning");
+      ctx.ui.notify(`Generation failed: ${cleanUiText(record.error ?? "unknown")}`, "warning");
       return;
     }
 
     reloadCustomAgents();
 
     if (existsSync(targetPath)) {
-      ctx.ui.notify(`Created ${targetPath}`, "info");
+      ctx.ui.notify(`Created ${cleanUiText(targetPath)}`, "info");
     } else {
       ctx.ui.notify("Agent generation completed but file was not created. Check the agent output.", "warning");
     }
@@ -2057,14 +2063,14 @@ ${systemPrompt}
     const targetPath = join(targetDir, `${name}.md`);
 
     if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
+      const overwrite = await ctx.ui.confirm("Overwrite", `${cleanUiText(targetPath)} already exists. Overwrite?`);
       if (!overwrite) return;
     }
 
     const { writeFileSync } = await import("node:fs");
     writeFileSync(targetPath, content, "utf-8");
     reloadCustomAgents();
-    ctx.ui.notify(`Created ${targetPath}`, "info");
+    ctx.ui.notify(`Created ${cleanUiText(targetPath)}`, "info");
   }
 
   function snapshotSettings(): SubagentsSettings {

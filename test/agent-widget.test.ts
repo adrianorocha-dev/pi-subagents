@@ -173,10 +173,11 @@ describe("AgentWidget", () => {
     widget.dispose();
   });
 
-  it("neutralizes terminal controls in external groups, descriptions, activity, and errors", () => {
+  it("neutralizes OSC 52, CSI, and C1 controls in external groups, descriptions, activity, and errors", () => {
+    const osc52 = "\u001b]52;c;d2lkZ2V0LWNsaXBib2FyZC1zZWNyZXQ=\u0007";
     const running = {
       ...makeRecord("running", { isBackground: true }),
-      description: "review\u001b[2J description",
+      description: `review${osc52}\u001b[2J description`,
     };
     const failed = {
       ...makeRecord("failed", { isBackground: true }),
@@ -200,7 +201,7 @@ describe("AgentWidget", () => {
     });
     widget.registerGroupProvider(() => [{
       id: "unsafe",
-      title: "Review\u001b]0;owned\u0007 workflow",
+      title: `Review${osc52}\u001b]0;owned\u0007 workflow`,
       detail: "2\u009b2J calls",
       narrator: "checking\u001b[31m changes",
       agentIds: [running.id, failed.id],
@@ -216,6 +217,7 @@ describe("AgentWidget", () => {
     expect(rendered).toContain("checking changes");
     expect(rendered).toContain("provider failure");
     expect(rendered).not.toContain("evil.example");
+    expect(rendered).not.toContain("d2lkZ2V0LWNsaXBib2FyZC1zZWNyZXQ=");
     expect(rendered).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/u);
     widget.dispose();
   });
