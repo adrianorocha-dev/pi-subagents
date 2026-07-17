@@ -484,14 +484,14 @@ Version 1 guarantees:
 - explicit types use the same case-insensitive lookup, frontmatter precedence, fuzzy model resolution, model-scope policy, thinking, max-turn, and worktree validation as `Agent`;
 - `{ baseConfig: { source: "embedded", name: "general-purpose" } }` selects the embedded default even when defaults are disabled or a project overrides that name;
 - `queue: "external"` bypasses the internal background queue and does not consume its concurrency slots;
-- `configureSession` is awaited after child extensions bind and before the first prompt; the supported mutable surface is `session.agent.state.tools`, `state.systemPrompt`, and `streamFn`;
+- `configureSession` is awaited after child extensions bind and before the first prompt; the supported surface includes mutable `session.agent.state.tools`, `state.systemPrompt`, `streamFn`, and `beforeToolCall`, awaited `agent.subscribe(...)` listeners, plus `prompt`, `steer`, `abort`, and `waitForIdle`;
 - `excludeExtensions` is an operational denylist applied before child binding and wins over custom-agent inclusion;
-- managed records stay in the shared manager, widget, and FleetView; `registerGroupProvider()` adds neutral nested group views to the shared `agents` widget;
-- `notification: "suppress"` suppresses the follow-up and, by default, parent `subagents:record` bookkeeping. Set `parentBookkeeping: "record"` to persist it independently;
+- managed records stay in the shared manager, widget, and FleetView; `registerGroupProvider()` adds neutral nested group views to the shared `agents` widget, with terminal controls removed from external labels and agent presentation text;
+- `notification: "suppress"` suppresses both the follow-up and parent `subagents:record` bookkeeping;
 - `transcriptDirectory` must already exist and receives `<agentId>.jsonl`;
 - completion resolves to normalized terminal status, text, lifetime usage, and worktree data only after the shared manager promise (including terminal events and cleanup) and all queued managed hooks settle. `stop(id)` synchronously reports whether cancellation was accepted but does not release completion; accepted cancellation normalizes the eventual status to `stopped`, and `waitForAll()` observes the same settlement boundary. `stop`, `get`, and `waitForAll` remain idempotent.
 
-The first/root activation owns the global symbol. Child activations cannot replace or release it, and root shutdown removes it. The exported TypeScript declarations are optional convenience; runtime discovery remains structural and does not require importing this package.
+The first activation whose root `session_start` actually binds owns the global symbol. Factory-only and later child activations publish no host, RPC handlers, or ready event; they cannot replace or release the owner. Root shutdown removes only its exact host instance. The exported TypeScript declarations are optional convenience; runtime discovery remains structural and does not require importing this package.
 
 ## Cross-Extension RPC
 

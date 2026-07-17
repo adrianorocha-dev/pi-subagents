@@ -123,6 +123,7 @@ export class AgentManager {
   private onStart?: OnAgentStart;
   private onCompact?: OnAgentCompact;
   private onSteer?: OnAgentSteer;
+  private readonly recordRemovalListeners = new Set<(agentId: string) => void>();
   private maxConcurrent: number;
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
@@ -570,6 +571,17 @@ export class AgentManager {
     return this.agents.get(id);
   }
 
+  /** Observe record eviction without coupling consumers to the cleanup timer. */
+  onRecordRemoved(listener: (agentId: string) => void): () => void {
+    this.recordRemovalListeners.add(listener);
+    let subscribed = true;
+    return () => {
+      if (!subscribed) return;
+      subscribed = false;
+      this.recordRemovalListeners.delete(listener);
+    };
+  }
+
   listAgents(): AgentRecord[] {
     return [...this.agents.values()].sort(
       (a, b) => b.startedAt - a.startedAt,
@@ -600,6 +612,9 @@ export class AgentManager {
     record.session?.dispose?.();
     record.session = undefined;
     this.agents.delete(id);
+    for (const listener of this.recordRemovalListeners) {
+      try { listener(id); } catch { /* ignore record-removal observer errors */ }
+    }
   }
 
   private cleanup() {
@@ -676,10 +691,8 @@ export class AgentManager {
     clearInterval(this.cleanupInterval);
     // Clear queue
     this.queue = [];
-    for (const record of this.agents.values()) {
-      record.session?.dispose();
-    }
-    this.agents.clear();
+    for (const [id, record] of this.agents) this.removeRecord(id, record);
+    this.recordRemovalListeners.clear();
     // Prune any orphaned git worktrees (crash recovery)
     try { pruneWorktrees(process.cwd()); } catch { /* ignore */ }
     // Also prune repos that caller-supplied cwds created worktrees in — a clean

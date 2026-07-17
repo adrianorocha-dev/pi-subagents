@@ -173,6 +173,53 @@ describe("AgentWidget", () => {
     widget.dispose();
   });
 
+  it("neutralizes terminal controls in external groups, descriptions, activity, and errors", () => {
+    const running = {
+      ...makeRecord("running", { isBackground: true }),
+      description: "review\u001b[2J description",
+    };
+    const failed = {
+      ...makeRecord("failed", { isBackground: true }),
+      description: "failed\u009b31m description",
+      status: "error",
+      error: "provider\u001b]8;;https://evil.example\u0007 failure\u001b]8;;\u0007",
+      completedAt: Date.now(),
+    };
+    const activity = makeActivity();
+    activity.responseText = "checking\u009d2;title\u009c changes";
+    const manager = { listAgents: () => [running, failed] };
+    const widget = new AgentWidget(
+      manager as any,
+      new Map([[running.id, activity]]),
+      () => "background",
+    );
+    let factory: any;
+    widget.setUICtx({
+      setStatus: () => {},
+      setWidget: (_key, content) => { factory = content; },
+    });
+    widget.registerGroupProvider(() => [{
+      id: "unsafe",
+      title: "Review\u001b]0;owned\u0007 workflow",
+      detail: "2\u009b2J calls",
+      narrator: "checking\u001b[31m changes",
+      agentIds: [running.id, failed.id],
+    }]);
+    widget.update();
+
+    const rendered = factory(
+      { terminal: { columns: 160 }, requestRender: () => {} },
+      theme,
+    ).render().join("\n");
+    expect(rendered).toContain("Review workflow");
+    expect(rendered).toContain("review description");
+    expect(rendered).toContain("checking changes");
+    expect(rendered).toContain("provider failure");
+    expect(rendered).not.toContain("evil.example");
+    expect(rendered).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/u);
+    widget.dispose();
+  });
+
   it("renders registered nested groups in provider order without duplicate agent rows", () => {
     const first = makeRecord("first", { isBackground: true });
     const second = makeRecord("second", { isBackground: true });

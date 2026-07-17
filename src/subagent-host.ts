@@ -14,7 +14,6 @@ import type {
   ManagedAgentStatus,
   ManagedAgentTerminalStatus,
   ManagedAgentUsage,
-  ManagedChildSession,
   ManagedSpawn,
   ManagedSpawnHooks,
   ManagedSpawnRequest,
@@ -93,17 +92,16 @@ function terminalStatusOf(record: AgentRecord): ManagedAgentTerminalStatus {
 
 function completionOf(record: AgentRecord, forcedStatus?: "stopped"): ManagedAgentCompletion {
   const status = forcedStatus ?? terminalStatusOf(record);
-  const base = {
+  const common = {
     agentId: record.id,
-    status,
-    text: status === "completed" ? record.result ?? "" : null,
     usage: usageOf(record),
-  } as const;
-  return {
-    ...base,
-    ...(status === "failed" ? { error: record.error ?? "Agent failed" } : {}),
     ...(record.worktreeResult === undefined ? {} : { worktree: { ...record.worktreeResult } }),
-  };
+  } as const;
+  if (status === "completed") return { ...common, status, text: record.result ?? "" };
+  if (status === "failed") {
+    return { ...common, status, text: null, error: record.error ?? "Agent failed" };
+  }
+  return { ...common, status, text: null };
 }
 
 /** Root-owned implementation of the version-one same-process host contract. */
@@ -114,9 +112,15 @@ export class ManagedSubagentHost implements SubagentHostV1 {
   private readonly ownedAgentIds = new Set<string>();
   private readonly state = new Map<string, HostAgentState>();
   private readonly groupDisposers = new Set<() => void>();
+  private readonly unregisterRecordRemoval: () => void;
   private disposed = false;
 
-  constructor(private readonly dependencies: SubagentHostDependencies) {}
+  constructor(private readonly dependencies: SubagentHostDependencies) {
+    this.unregisterRecordRemoval = dependencies.manager.onRecordRemoved?.((agentId) => {
+      this.ownedAgentIds.delete(agentId);
+      this.state.delete(agentId);
+    }) ?? (() => undefined);
+  }
 
   spawn(request: ManagedSpawnRequest, hooks: ManagedSpawnHooks = {}): ManagedSpawn {
     if (this.disposed) throw new Error("The pi-subagents host has been disposed.");
@@ -157,9 +161,7 @@ export class ManagedSubagentHost implements SubagentHostV1 {
     let recordAtCreation: AgentRecord | undefined;
 
     const suppressNotification = request.notification === "suppress";
-    const suppressParentRecord = request.parentBookkeeping === undefined
-      ? suppressNotification
-      : request.parentBookkeeping === "suppress";
+    const suppressParentRecord = suppressNotification;
 
     const agentId = this.dependencies.manager.spawn(
       this.dependencies.pi,
@@ -185,7 +187,7 @@ export class ManagedSubagentHost implements SubagentHostV1 {
         suppressParentRecord,
         metadata: request.metadata,
         configureSession: async (session) => {
-          await hooks.configureSession?.(session as unknown as ManagedChildSession);
+          await hooks.configureSession?.(session);
         },
         onCreated: (record) => {
           recordAtCreation = record;
@@ -308,7 +310,10 @@ export class ManagedSubagentHost implements SubagentHostV1 {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.unregisterRecordRemoval();
     for (const agentId of [...this.active.keys()]) this.stop(agentId);
     for (const unregister of [...this.groupDisposers]) unregister();
+    this.ownedAgentIds.clear();
+    this.state.clear();
   }
 }

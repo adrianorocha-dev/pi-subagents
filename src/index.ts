@@ -66,8 +66,15 @@ export type {
   ManagedAgentTerminalStatus,
   ManagedAgentTurn,
   ManagedAgentUsage,
+  ManagedChildAgentEventListener,
+  ManagedChildBeforeToolCall,
+  ManagedChildModel,
   ManagedChildSession,
+  ManagedChildStream,
+  ManagedChildStreamContext,
   ManagedChildStreamFn,
+  ManagedChildStreamOptions,
+  ManagedChildStreamResult,
   ManagedChildTool,
   ManagedSpawn,
   ManagedSpawnHooks,
@@ -510,18 +517,17 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
     manager.clearCompleted(true);
-    // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
-    // fires once per activation, but a double-bind must not leak listeners.
-    if (!rpcHandle) {
+    // Only the first activation whose session_start actually binds may claim
+    // the root host, RPC channels, and readiness broadcast. Factory-only
+    // activations and later child sessions stay silent on the shared bus.
+    if (!rpcHandle && claimManagedHost()) {
       rpcHandle = registerRpcHandlers({
         events: pi.events,
         pi,
         getCtx: () => currentCtx,
         manager,
       });
-      // Broadcast readiness so extensions loaded alongside us can discover us.
-      // Emitting after all factories have run (rather than at factory time)
-      // also avoids the race where a consumer loaded after us misses the event.
+      // The host slot and RPC listeners are live before consumers see ready.
       pi.events.emit("subagents:ready", {});
     }
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
@@ -732,10 +738,14 @@ export default function (pi: ExtensionAPI) {
     (event, payload) => pi.events.emit(event, payload),
   );
 
-  // First activation owns the versioned host. Child sessions may run this
-  // factory in-process, but cannot replace or release the root's host.
-  if (Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL) === undefined) {
-    managedHost = new ManagedSubagentHost({
+  /** Claim the host slot only from a bound root session_start. */
+  function claimManagedHost(): boolean {
+    if (managedHost !== undefined) {
+      return ownsHostRegistry && Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL) === managedHost;
+    }
+    if (Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL) !== undefined) return false;
+
+    const host = new ManagedSubagentHost({
       pi,
       manager,
       getContext: () => currentCtx,
@@ -751,8 +761,13 @@ export default function (pi: ExtensionAPI) {
       },
       registerGroupProvider: (provider) => widget.registerGroupProvider(provider),
     });
-    Reflect.set(globalThis, SUBAGENT_HOST_SYMBOL, managedHost);
+    if (!Reflect.set(globalThis, SUBAGENT_HOST_SYMBOL, host) || Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL) !== host) {
+      host.dispose();
+      return false;
+    }
+    managedHost = host;
     ownsHostRegistry = true;
+    return true;
   }
 
   // ---- Agent tool ----

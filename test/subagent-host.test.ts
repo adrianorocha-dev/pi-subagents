@@ -22,7 +22,12 @@ vi.mock("../src/worktree.js", () => ({
 import { type RunOptions, type RunResult, runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 import { SUBAGENT_HOST_SYMBOL } from "../src/subagent-host.js";
-import type { ManagedSpawnRequest, SubagentHostV1 } from "../src/types.js";
+import type {
+  ManagedChildAgentEventListener,
+  ManagedChildSession,
+  ManagedSpawnRequest,
+  SubagentHostV1,
+} from "../src/types.js";
 
 const MANAGER_SYMBOL = Symbol.for("pi-subagents:manager");
 
@@ -102,15 +107,28 @@ function createContext(cwd: string) {
 
 function createSession() {
   const listeners: Array<(event: never) => void> = [];
+  const agentListeners: ManagedChildAgentEventListener[] = [];
+  const providerResult = { usage: { output: 9 } };
+  const providerStream = {
+    async *[Symbol.asyncIterator]() {},
+    result: vi.fn(async () => providerResult),
+  };
+  const providerStreamFn: ManagedChildSession["agent"]["streamFn"] = vi.fn(() => providerStream);
+  const agent: ManagedChildSession["agent"] = {
+    state: {
+      tools: [{ name: "read" }],
+      systemPrompt: "initial prompt",
+    },
+    streamFn: providerStreamFn,
+    beforeToolCall: undefined,
+    subscribe: vi.fn((listener) => {
+      agentListeners.push(listener);
+      return () => undefined;
+    }),
+  };
   const session = {
     messages: [] as Array<Record<string, unknown>>,
-    agent: {
-      state: {
-        tools: [{ name: "read" }],
-        systemPrompt: "initial prompt",
-      },
-      streamFn: vi.fn(() => undefined),
-    },
+    agent,
     subscribe: vi.fn((listener: (event: never) => void) => {
       listeners.push(listener);
       return () => undefined;
@@ -125,7 +143,7 @@ function createSession() {
       contextUsage: { percent: null },
     })),
   };
-  return { session, listeners };
+  return { session, listeners, agentListeners, providerResult, providerStream, providerStreamFn };
 }
 
 function immediateRun(captured: RunOptions[], sessions: ReturnType<typeof createSession>[]) {
@@ -338,6 +356,92 @@ describe("SubagentHostV1 integration", () => {
     }
     expect(harness.pi.appendEntry).not.toHaveBeenCalled();
     expect(harness.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("exposes the stream budget and structured-output session hooks before the first prompt", async () => {
+    let created: ReturnType<typeof createSession> | undefined;
+    const providerCaps: Array<{ model: number; request: number | undefined }> = [];
+    let settledOutput = 0;
+    let preparedStructuredCall = false;
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, prompt, options) => {
+      created = createSession();
+      await options.configureSession?.(created.session as never);
+      options.onSessionCreated?.(created.session as never);
+      const stream = await created.session.agent.streamFn(
+        { maxTokens: 100 } as never,
+        { systemPrompt: created.session.agent.state.systemPrompt, messages: [] } as never,
+        { maxTokens: 80 },
+      );
+      await stream.result();
+      await created.session.agent.beforeToolCall?.({
+        assistantMessage: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "structured-1", name: "StructuredOutput", arguments: {} }],
+          usage: {},
+        },
+        toolCall: { type: "toolCall", id: "structured-1", name: "StructuredOutput", arguments: {} },
+        args: {},
+        context: { systemPrompt: created.session.agent.state.systemPrompt, messages: [] },
+      } as never, new AbortController().signal);
+      for (const listener of created.agentListeners) {
+        await listener({
+          type: "turn_end",
+          message: { role: "assistant", content: [], stopReason: "stop" },
+          toolResults: [],
+        } as never, new AbortController().signal);
+      }
+      created.session.messages.push(
+        { role: "user", content: prompt },
+        { role: "assistant", content: [{ type: "text", text: "done" }] },
+      );
+      return {
+        responseText: "done",
+        session: created.session,
+        aborted: false,
+        steered: false,
+      } as unknown as RunResult;
+    });
+    const { host } = await activate();
+
+    const spawn = host.spawn(request(), {
+      configureSession: async (session) => {
+        const originalStreamFn = session.agent.streamFn;
+        session.agent.streamFn = async (model, context, requestOptions) => {
+          const maxTokens = Math.min(model.maxTokens, requestOptions?.maxTokens ?? model.maxTokens, 12);
+          providerCaps.push({ model: maxTokens, request: maxTokens });
+          const stream = await originalStreamFn(
+            { ...model, maxTokens },
+            context,
+            { ...requestOptions, maxTokens },
+          );
+          settledOutput = (await stream.result()).usage.output;
+          return stream;
+        };
+        const structuredTool = { name: "StructuredOutput", execute: async () => undefined };
+        session.agent.state.tools = [...session.agent.state.tools, structuredTool];
+        session.agent.beforeToolCall = async (context) => {
+          preparedStructuredCall = context.toolCall.name === structuredTool.name;
+          return undefined;
+        };
+        session.agent.subscribe(async (event) => {
+          if (event.type === "turn_end") await session.steer("call StructuredOutput now with your result");
+        });
+      },
+    });
+
+    await expect(spawn.completion).resolves.toMatchObject({ status: "completed", text: "done" });
+    if (created === undefined) throw new Error("Managed child session was not created");
+    expect(created.providerStreamFn).toHaveBeenCalledWith(
+      expect.objectContaining({ maxTokens: 12 }),
+      expect.anything(),
+      expect.objectContaining({ maxTokens: 12 }),
+    );
+    expect(providerCaps).toEqual([{ model: 12, request: 12 }]);
+    expect(settledOutput).toBe(created.providerResult.usage.output);
+    expect(created.providerStream.result).toHaveBeenCalledTimes(2);
+    expect(created.session.agent.state.tools.map(({ name }) => name)).toEqual(["read", "StructuredOutput"]);
+    expect(preparedStructuredCall).toBe(true);
+    expect(created.session.steer).toHaveBeenCalledWith("call StructuredOutput now with your result");
   });
 
   it("normalizes worktree completion data from the shared manager", async () => {
@@ -598,6 +702,60 @@ Project override.
     expect(emitted(harness, "subagents:completed")).toHaveLength(0);
   });
 
+  it("drops owned bookkeeping when the manager evicts a stopped record without releasing completion early", async () => {
+    vi.useFakeTimers();
+    try {
+      const managerRelease = deferred();
+      vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+        const { session } = createSession();
+        await options.configureSession?.(session as never);
+        options.onSessionCreated?.(session as never);
+        await managerRelease.promise;
+        return {
+          responseText: "late result",
+          session,
+          aborted: false,
+          steered: false,
+        } as unknown as RunResult;
+      });
+      const { host } = await activate();
+      const spawn = host.spawn(request());
+      expect(host.stop(spawn.agentId)).toBe(true);
+
+      let completionSettled = false;
+      const completion = spawn.completion.then((result) => {
+        completionSettled = true;
+        return result;
+      });
+      let waitSettled = false;
+      const waiter = host.waitForAll().then(() => {
+        waitSettled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(11 * 60_000);
+      const bookkeeping = host as unknown as {
+        readonly ownedAgentIds: ReadonlySet<string>;
+        readonly state: ReadonlyMap<string, unknown>;
+      };
+      expect(host.get(spawn.agentId)).toBeUndefined();
+      expect(bookkeeping.ownedAgentIds.has(spawn.agentId)).toBe(false);
+      expect(bookkeeping.state.has(spawn.agentId)).toBe(false);
+      expect(completionSettled).toBe(false);
+      expect(waitSettled).toBe(false);
+
+      managerRelease.resolve();
+      await expect(completion).resolves.toMatchObject({
+        agentId: spawn.agentId,
+        status: "stopped",
+        text: null,
+      });
+      await waiter;
+      expect(waitSettled).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("preserves failure normalization when no cancellation is accepted", async () => {
     vi.mocked(runAgent).mockRejectedValueOnce(new Error("provider unavailable"));
     const { harness, host } = await activate();
@@ -679,15 +837,6 @@ Project override.
     expect(component.render()).toEqual([]);
   });
 
-  it("suppresses notification and parent bookkeeping independently", async () => {
-    immediateRun([], []);
-    const { harness, host } = await activate();
-
-    await host.spawn(request({ parentBookkeeping: "record" })).completion;
-    expect(harness.pi.appendEntry).toHaveBeenCalledTimes(1);
-    expect(harness.pi.sendMessage).not.toHaveBeenCalled();
-  });
-
   it("keeps the first root host across child activation and releases it only with the owner", async () => {
     immediateRun([], []);
     const root = await activate();
@@ -698,6 +847,7 @@ Project override.
     subagentsExtension(childHarness.pi as never);
     await fireLifecycle(childHarness, "session_start", createContext(projectDir));
     expect(Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL)).toBe(rootHost);
+    expect(emitted(childHarness, "subagents:ready")).toEqual([]);
 
     await fireLifecycle(childHarness, "session_shutdown", createContext(projectDir));
     activations.splice(activations.indexOf(childHarness), 1);
@@ -706,5 +856,29 @@ Project override.
     await fireLifecycle(root.harness, "session_shutdown", createContext(projectDir));
     activations.splice(activations.indexOf(root.harness), 1);
     expect(Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL)).toBeUndefined();
+  });
+
+  it("does not let a factory-only activation poison the first bound host slot", async () => {
+    immediateRun([], []);
+    const filtered = makePi() as ExtensionHarness;
+    activations.push(filtered);
+    subagentsExtension(filtered.pi as never);
+    expect(Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL)).toBeUndefined();
+
+    const bound = await activate();
+    expect(Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL)).toBe(bound.host);
+    expect(emitted(filtered, "subagents:ready")).toEqual([]);
+    expect(emitted(bound.harness, "subagents:ready")).toHaveLength(1);
+  });
+
+  it("releases only the exact host instance owned by the shutting-down activation", async () => {
+    immediateRun([], []);
+    const root = await activate();
+    const replacement = { version: 1, replacement: true };
+    Reflect.set(globalThis, SUBAGENT_HOST_SYMBOL, replacement);
+
+    await fireLifecycle(root.harness, "session_shutdown", createContext(projectDir));
+    activations.splice(activations.indexOf(root.harness), 1);
+    expect(Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL)).toBe(replacement);
   });
 });

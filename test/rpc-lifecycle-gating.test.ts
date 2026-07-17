@@ -27,6 +27,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { SUBAGENT_HOST_SYMBOL } from "../src/subagent-host.js";
 
 const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
 
@@ -75,6 +76,7 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
   let prevCwd: string;
   let prevAgentDir: string | undefined;
   let prevHome: string | undefined;
+  let priorHost: unknown;
 
   beforeEach(() => {
     // Hermetic cwd + global dir with scheduling off, so session_start doesn't
@@ -85,6 +87,8 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     prevHome = process.env.HOME;
     process.env.PI_CODING_AGENT_DIR = agentDir;
     process.env.HOME = agentDir;
+    priorHost = Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL);
+    Reflect.deleteProperty(globalThis, SUBAGENT_HOST_SYMBOL);
     prevCwd = process.cwd();
     mkdirSync(join(tmpDir, ".pi"), { recursive: true });
     writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false }));
@@ -97,6 +101,8 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
     if (prevHome == null) delete process.env.HOME;
     else process.env.HOME = prevHome;
+    if (priorHost === undefined) Reflect.deleteProperty(globalThis, SUBAGENT_HOST_SYMBOL);
+    else Reflect.set(globalThis, SUBAGENT_HOST_SYMBOL, priorHost);
     rmSync(tmpDir, { recursive: true, force: true });
     rmSync(agentDir, { recursive: true, force: true });
     vi.restoreAllMocks();
@@ -111,6 +117,7 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     subagentsExtension(pi);
 
     expect(readyEmits(pi), "no subagents:ready before session_start").toHaveLength(0);
+    expect(Reflect.get(globalThis, SUBAGENT_HOST_SYMBOL), "no host before session_start").toBeUndefined();
     for (const channel of RPC_CHANNELS) {
       expect(busHandlers.has(channel), `${channel} must not be registered at factory time`).toBe(false);
     }

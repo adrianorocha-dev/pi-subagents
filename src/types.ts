@@ -2,7 +2,8 @@
  * types.ts — Type definitions for the subagent system.
  */
 
-import type { ThinkingLevel } from "@earendil-works/pi-ai";
+import type { AgentEvent, BeforeToolCallContext, BeforeToolCallResult } from "@earendil-works/pi-agent-core";
+import type { Api, Context, Model, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { LifetimeUsage } from "./usage.js";
 
@@ -216,8 +217,8 @@ export interface ScheduleStoreData {
 // ---- Versioned same-process host contract ----
 
 export type ManagedThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-export type ManagedAgentStatus = "queued" | "running" | "completed" | "failed" | "stopped";
-export type ManagedAgentTerminalStatus = Extract<ManagedAgentStatus, "completed" | "failed" | "stopped">;
+export type ManagedAgentStatus = "queued" | "running" | "completed" | "failed" | "skipped" | "stopped";
+export type ManagedAgentTerminalStatus = Extract<ManagedAgentStatus, "completed" | "failed" | "skipped" | "stopped">;
 
 export interface ManagedAgentUsage {
   readonly input: number;
@@ -259,8 +260,6 @@ export interface ManagedSpawnRequestBase {
   readonly cwd?: string;
   readonly queue: "external";
   readonly notification: "suppress";
-  /** Defaults to `suppress` when notification is suppressed. */
-  readonly parentBookkeeping?: "record" | "suppress";
   readonly metadata: Readonly<Record<string, unknown>>;
   readonly excludeExtensions: readonly string[];
   /** Existing directory; the host writes `<transcriptDirectory>/<agentId>.jsonl`. */
@@ -278,7 +277,32 @@ export interface ManagedChildTool {
   readonly name: string;
 }
 
-export type ManagedChildStreamFn = (...args: never[]) => unknown;
+export type ManagedChildAgentEventListener = (event: AgentEvent, signal: AbortSignal) => void | Promise<void>;
+
+export type ManagedChildBeforeToolCall = (
+  context: BeforeToolCallContext,
+  signal?: AbortSignal,
+) => Promise<BeforeToolCallResult | undefined>;
+
+export type ManagedChildModel = Model<Api>;
+export type ManagedChildStreamContext = Context;
+export type ManagedChildStreamOptions = SimpleStreamOptions;
+
+export interface ManagedChildStreamResult {
+  readonly usage: {
+    readonly output: number;
+  };
+}
+
+export interface ManagedChildStream extends AsyncIterable<unknown> {
+  result(): Promise<ManagedChildStreamResult>;
+}
+
+export type ManagedChildStreamFn = (
+  model: ManagedChildModel,
+  context: ManagedChildStreamContext,
+  options?: ManagedChildStreamOptions,
+) => ManagedChildStream | Promise<ManagedChildStream>;
 
 /** Supported mutable child surface passed after extension binding and before the first prompt. */
 export interface ManagedChildSession {
@@ -288,6 +312,8 @@ export interface ManagedChildSession {
       systemPrompt: string;
     };
     streamFn: ManagedChildStreamFn;
+    beforeToolCall?: ManagedChildBeforeToolCall;
+    subscribe(listener: ManagedChildAgentEventListener): () => void;
   };
   prompt(text: string): Promise<void>;
   steer(text: string): Promise<void>;
@@ -303,14 +329,30 @@ export interface ManagedSpawnHooks {
   readonly onUsage?: (usage: ManagedAgentUsage) => void | Promise<void>;
 }
 
-export interface ManagedAgentCompletion {
+interface ManagedAgentCompletionBase {
   readonly agentId: string;
-  readonly status: ManagedAgentTerminalStatus;
-  readonly text: string | null;
   readonly usage: ManagedAgentUsage;
-  readonly error?: string;
   readonly worktree?: ManagedWorktreeResult;
 }
+
+export type ManagedAgentCompletion = ManagedAgentCompletionBase &
+  (
+    | {
+        readonly status: "completed";
+        readonly text: string;
+        readonly error?: never;
+      }
+    | {
+        readonly status: "failed";
+        readonly text: null;
+        readonly error: string;
+      }
+    | {
+        readonly status: "skipped" | "stopped";
+        readonly text: null;
+        readonly error?: string;
+      }
+  );
 
 export interface ManagedSpawn {
   readonly agentId: string;

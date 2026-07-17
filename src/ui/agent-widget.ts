@@ -17,6 +17,7 @@ import type {
   WidgetMode,
 } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
+import { cleanUiText } from "./terminal-controls.js";
 
 // ---- Constants ----
 
@@ -158,7 +159,7 @@ export function formatDuration(startedAt: number, completedAt?: number): string 
 
 /** Get display name for any agent type (built-in or custom). */
 export function getDisplayName(type: SubagentType): string {
-  return getConfig(type).displayName;
+  return cleanUiText(getConfig(type).displayName);
 }
 
 /** Short label for prompt mode: "twin" for append, nothing for replace (the default). */
@@ -184,7 +185,7 @@ export function buildInvocationTags(
 
 /** Truncate text to a single line, max `len` chars. */
 function truncateLine(text: string, len = 60): string {
-  const line = text.split("\n").find(l => l.trim())?.trim() ?? "";
+  const line = cleanUiText(text);
   if (line.length <= len) return line;
   return line.slice(0, len) + "…";
 }
@@ -194,7 +195,7 @@ export function describeActivity(activeTools: Map<string, string>, responseText?
   if (activeTools.size > 0) {
     const groups = new Map<string, number>();
     for (const toolName of activeTools.values()) {
-      const action = TOOL_DISPLAY[toolName] ?? toolName;
+      const action = cleanUiText(TOOL_DISPLAY[toolName] ?? toolName);
       groups.set(action, (groups.get(action) ?? 0) + 1);
     }
 
@@ -359,7 +360,8 @@ export class AgentWidget {
       statusText = theme.fg("dim", " stopped");
     } else if (a.status === "error") {
       icon = theme.fg("error", "✗");
-      const errMsg = a.error ? `: ${a.error.slice(0, 60)}` : "";
+      const error = cleanUiText(a.error ?? "");
+      const errMsg = error ? `: ${error.slice(0, 60)}` : "";
       statusText = theme.fg("error", ` error${errMsg}`);
     } else {
       // aborted
@@ -374,7 +376,7 @@ export class AgentWidget {
     parts.push(duration);
 
     const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-    return `${icon} ${theme.fg("dim", name)}${modeTag}  ${theme.fg("dim", a.description)} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
+    return `${icon} ${theme.fg("dim", name)}${modeTag}  ${theme.fg("dim", cleanUiText(a.description))} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
   }
 
   /**
@@ -438,7 +440,7 @@ export class AgentWidget {
       const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
 
       runningLines.push([
-        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
+        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", cleanUiText(a.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
         truncate(theme.fg("dim", "│  ") + theme.fg("dim", `  ⎿  ${activity}`)),
       ]);
     }
@@ -539,7 +541,7 @@ export class AgentWidget {
     const renderAgent = (agent: AgentRecord, depth: number): string[] => {
       const indent = "  ".repeat(depth);
       if (agent.status === "queued") {
-        return [truncate(`${indent}${theme.fg("muted", "◦")} ${theme.fg("dim", getDisplayName(agent.type))}  ${theme.fg("muted", agent.description)}`)];
+        return [truncate(`${indent}${theme.fg("muted", "◦")} ${theme.fg("dim", getDisplayName(agent.type))}  ${theme.fg("muted", cleanUiText(agent.description))}`)];
       }
       if (agent.status !== "running") {
         return [truncate(`${indent}${this.renderFinishedLine(agent, theme)}`)];
@@ -561,15 +563,15 @@ export class AgentWidget {
       const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
       const activityText = activity ? describeActivity(activity.activeTools, activity.responseText) : "thinking…";
       return [
-        truncate(`${indent}${theme.fg("accent", frame)} ${theme.bold(getDisplayName(agent.type))}${modeTag}  ${theme.fg("muted", agent.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", parts.join(" · "))}`),
+        truncate(`${indent}${theme.fg("accent", frame)} ${theme.bold(getDisplayName(agent.type))}${modeTag}  ${theme.fg("muted", cleanUiText(agent.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", parts.join(" · "))}`),
         truncate(`${indent}  ${theme.fg("dim", `⎿  ${activityText}`)}`),
       ];
     };
 
     const addGroup = (group: AgentGroupView, depth: number): void => {
-      const detail = group.detail ? ` ${theme.fg("dim", group.detail)}` : "";
-      const narrator = group.narrator ? ` ${theme.fg("muted", `· ${group.narrator}`)}` : "";
-      items.push([truncate(`${"  ".repeat(depth)}${theme.fg("accent", "◇")} ${theme.bold(group.title)}${detail}${narrator}`)]);
+      const detail = group.detail ? ` ${theme.fg("dim", cleanUiText(group.detail))}` : "";
+      const narrator = group.narrator ? ` ${theme.fg("muted", `· ${cleanUiText(group.narrator)}`)}` : "";
+      items.push([truncate(`${"  ".repeat(depth)}${theme.fg("accent", "◇")} ${theme.bold(cleanUiText(group.title))}${detail}${narrator}`)]);
       for (const agentId of group.agentIds) {
         if (seen.has(agentId)) continue;
         const agent = byId.get(agentId);
